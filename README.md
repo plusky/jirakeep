@@ -2,46 +2,70 @@
 
 **jirakeep** is a Model Context Protocol (MCP) server, written in Rust, with
 operator-controlled security guards. It exposes an **Atlassian Jira Cloud**
-site to LLM clients — while a policy file that the model can neither see nor
+site to LLM clients while a policy file that the model can neither see nor
 change decides, per issue, what the model is allowed to do.
 
-It is a **sibling** of [bugwarden](https://github.com/plusky/bugwarden)
-(Bugzilla), not a second backend inside it. Same operational shape (policy
-guard, CI/release, fail-closed design); separate repository and crate so
-Bugzilla-specific invariants stay honest.
+Sibling of [bugwarden](https://github.com/plusky/bugwarden) (Bugzilla): same
+operational shape (policy guard, CI/release, fail-closed design), separate
+repository so tracker-specific invariants stay honest. See
+[bugwarden#69](https://github.com/plusky/bugwarden/issues/69) (Option B).
 
-> **Status: early skeleton (0.1.0).** The workspace, CLI, policy load path,
-> CI/release pipelines, and two info tools are in place. Issue
-> read/search/write tools, full policy matching, and live Jira calls are
-> not implemented yet. See [`docs/DESIGN.md`](docs/DESIGN.md).
+## Features
 
-## Features (planned / partial)
-
-* **Guard policy engine** — operator TOML; allow / deny / restrict with a
-  capability vocabulary; fail closed (DESIGN.md).
+* **Guard policy engine** — TOML rules: allow / deny / restrict with a
+  13-capability vocabulary; match on project, components, labels, status,
+  priority, issue type, security level, summary text, public-project flag,
+  age, and `created_by_me`.
+* **Fail-closed visibility** — missing security level is **not** treated as
+  public; declare public projects under `global.public_projects`.
 * **No existence oracle** — denied and missing issues share one denial text.
-* **Jira Cloud first** — Basic auth (email + API token); Data Center later.
+* **Silent search filtering** — JQL results drop denied issues without counts.
+* **Restricted comments** — dual opt-in (policy + per-call flag).
+* **Read + write tools** — issues, comments, history, search, attachments,
+  transitions, assign, field update, watchers, links, create, attach.
+* **Audit stream** — operator-only JSONL (`--audit-config`); never on MCP.
 * **Two transports** — streamable HTTP and stdio.
-* **Audit stream** — planned (operator-only JSONL; never on the MCP surface).
+* **Cloud Basic auth** — email + API token (server-held or per-request headers).
 
-## Skeleton tools
+## Tools
 
-| Tool | Description |
-|------|-------------|
-| `mcp_server_info` | Coarse server + policy facts (no rule names) |
-| `jira_server_info` | Static skeleton status (does not call Jira) |
+| Tool | Kind |
+|------|------|
+| `mcp_server_info` | meta |
+| `jira_server_info` | read |
+| `issue_info` | read |
+| `issue_comments` | read |
+| `issue_history` | read |
+| `issues_search` | read (JQL) |
+| `list_attachments` / `download_attachment` | read |
+| `issue_url` | local |
+| `summarize_issue` | read (prompt) |
+| `list_transitions` | read |
+| `add_comment` | write |
+| `transition_issue` | write |
+| `assign_issue` | write |
+| `update_issue_fields` | write |
+| `add_watcher` | write |
+| `link_issues` | write |
+| `create_issue` | write |
+| `add_attachment` | write |
 
-## Quick start (skeleton)
+Write tools vanish from the listing in read-only mode or via
+`global.disabled_tools` (I13).
+
+## Quick start
 
 ```bash
 cargo build --release -p jirakeep
 
-# HTTP (default): listen on 127.0.0.1:8000
+# HTTP (default): clients send token in ApiKey header; email via
+# X-Atlassian-Email or --email on the server
 ./target/release/jirakeep \
   --jira-server https://example.atlassian.net \
-  --policy examples/policy.toml
+  --policy examples/policy.toml \
+  --audit-config examples/audit.toml
 
-# stdio (requires token + email for Cloud Basic auth)
+# stdio (server-held Cloud Basic credentials)
 ./target/release/jirakeep \
   --transport stdio \
   --jira-server https://example.atlassian.net \
@@ -50,31 +74,12 @@ cargo build --release -p jirakeep
   --policy examples/policy.toml
 ```
 
-## Installation
-
-### From source
-
-```bash
-git clone https://github.com/plusky/jirakeep
-cd jirakeep
-cargo build --release
-# binary at target/release/jirakeep
-```
-
-The repository pins its Rust toolchain via `rust-toolchain.toml`. Building
-`reqwest`/`aws-lc-sys` needs a C toolchain (compiler + `cmake`).
-
-### crates.io
-
-Not published until the first real feature release. The release workflow is
-already wired for Trusted Publishing.
-
 ## Policy
 
 See [`examples/policy.toml`](examples/policy.toml) and
-[`docs/DESIGN.md`](docs/DESIGN.md). Critical Jira-specific rule: **an issue
-with no security level is not world-readable**; declare public projects
-explicitly under `global.public_projects`.
+[`docs/DESIGN.md`](docs/DESIGN.md).
+
+Critical Jira rule: **an issue with no security level is not world-readable**.
 
 ## Development
 
@@ -84,11 +89,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p jirakeep --features gen --all-targets -- -D warnings
 cargo test --workspace --all-targets --locked
 cargo deny check
-```
-
-Regenerate man page and shell completions:
-
-```bash
 cargo run --locked -p jirakeep --features gen --bin jirakeep-gen
 ```
 

@@ -11,56 +11,46 @@ use clap::{Parser, ValueEnum};
 /// Transport for the MCP server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Transport {
-    /// Streamable HTTP transport (default). Clients send the Jira API token
-    /// per-request via the API key header, unless `--api-key-file` selects
-    /// server-held token mode (then the header is not consulted at all).
+    /// Streamable HTTP transport (default).
     Http,
-    /// Stdio transport. Token and email come from flags/env/files at startup.
+    /// Stdio transport.
     Stdio,
 }
 
 /// MCP server for Atlassian Jira Cloud with operator-controlled security guards.
-// Keep this doc comment to ONE paragraph so clap does not resurrect it as
-// long_about (see bugwarden: multi-paragraph docs once leaked into --help).
 #[derive(Parser)]
 #[command(name = "jirakeep", version, about)]
 pub struct Cli {
     /// Base URL of the Jira Cloud site (e.g. 'https://example.atlassian.net').
-    /// Environment variable JIRA_SERVER is used if the argument is not provided.
     #[arg(long, env = "JIRA_SERVER")]
     pub jira_server: String,
 
-    /// Transport for the MCP server: 'http' (default) or 'stdio'. Environment
-    /// variable MCP_TRANSPORT can also be used.
+    /// Transport for the MCP server: 'http' (default) or 'stdio'.
     #[arg(long, env = "MCP_TRANSPORT", value_enum, default_value = "http")]
     pub transport: Transport,
 
     /// Host address for the MCP server to listen on (http transport only).
-    /// Defaults to 127.0.0.1 or the MCP_HOST environment variable.
     #[arg(long, env = "MCP_HOST", default_value = "127.0.0.1")]
     pub host: String,
 
-    /// Port for the MCP server to listen on (http transport only). Defaults
-    /// to 8000 or the MCP_PORT environment variable.
+    /// Port for the MCP server to listen on (http transport only).
     #[arg(long, env = "MCP_PORT", default_value_t = 8000)]
     pub port: u16,
 
-    /// HTTP header for clients to send the Jira API token. Defaults to
-    /// 'ApiKey' or the MCP_API_KEY_HEADER environment variable. Not consulted
-    /// in server-held token mode (--api-key-file over http).
+    /// HTTP header for clients to send the Jira API token.
     #[arg(long, env = "MCP_API_KEY_HEADER", default_value = "ApiKey")]
     pub api_key_header: String,
 
-    /// Jira Cloud API token. Required for --transport stdio unless
-    /// --api-key-file provides it. Environment variable JIRA_API_TOKEN can
-    /// also be used. Ignored for --transport http unless --api-key-file is
-    /// set (clients send the token per-request; use --api-key-file for a
-    /// server-held token).
+    /// HTTP header for clients to send the Atlassian account email (per-request
+    /// Cloud Basic auth when --email is not set on the server).
+    #[arg(long, env = "MCP_EMAIL_HEADER", default_value = "X-Atlassian-Email")]
+    pub email_header: String,
+
+    /// Jira Cloud API token.
     #[arg(long, env = "JIRA_API_TOKEN", hide_env_values = true)]
     pub api_key: Option<String>,
 
-    /// Path to a file holding the Jira Cloud API token. Mutually exclusive
-    /// with --api-key. Over http this selects server-held token mode.
+    /// Path to a file holding the Jira Cloud API token.
     #[arg(
         long,
         env = "JIRA_API_TOKEN_FILE",
@@ -69,14 +59,11 @@ pub struct Cli {
     )]
     pub api_key_file: Option<PathBuf>,
 
-    /// Atlassian account email for Cloud Basic auth. Environment variable
-    /// JIRA_EMAIL can also be used. Required whenever a token is used
-    /// (stdio, or http server-held mode).
+    /// Atlassian account email for Cloud Basic auth.
     #[arg(long, env = "JIRA_EMAIL")]
     pub email: Option<String>,
 
-    /// Path to a file holding the Atlassian account email. Mutually exclusive
-    /// with --email.
+    /// Path to a file holding the Atlassian account email.
     #[arg(
         long,
         env = "JIRA_EMAIL_FILE",
@@ -85,20 +72,19 @@ pub struct Cli {
     )]
     pub email_file: Option<PathBuf>,
 
-    /// Disables all tools which modify Jira state. Environment variable
-    /// MCP_READ_ONLY=true can also be used. Can only tighten the guard
-    /// policy, never loosen it.
+    /// Disables all tools which modify Jira state.
     #[arg(long, env = "MCP_READ_ONLY")]
     pub read_only: bool,
 
-    /// Path to the guard policy TOML file. Environment variable
-    /// JIRAKEEP_POLICY can also be used. Without it an allow-all default
-    /// policy is used (restricted comments still off).
+    /// Path to the guard policy TOML file.
     #[arg(long, env = "JIRAKEEP_POLICY", value_hint = clap::ValueHint::FilePath)]
     pub policy: Option<PathBuf>,
+
+    /// Path to the audit configuration TOML file.
+    #[arg(long, env = "JIRAKEEP_AUDIT_CONFIG", value_hint = clap::ValueHint::FilePath)]
+    pub audit_config: Option<PathBuf>,
 }
 
-/// Manual impl so tokens and emails never reach a log through `{:?}` (I12).
 impl std::fmt::Debug for Cli {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cli")
@@ -107,42 +93,30 @@ impl std::fmt::Debug for Cli {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("api_key_header", &self.api_key_header)
+            .field("email_header", &self.email_header)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("api_key_file", &self.api_key_file)
             .field("email", &self.email.as_ref().map(|_| "<redacted>"))
             .field("email_file", &self.email_file)
             .field("read_only", &self.read_only)
             .field("policy", &self.policy)
+            .field("audit_config", &self.audit_config)
             .finish()
     }
 }
 
-/// The clap command for the `jirakeep` binary — the single definition the
-/// server parses and `jirakeep-gen` renders into the man page and shell
-/// completions.
 pub fn command() -> clap::Command {
     use clap::CommandFactory as _;
     Cli::command()
 }
 
-/// Who holds the Jira API token, resolved exactly once at startup.
-///
-/// No Debug impl: the `Server` variant carries the token itself (I12).
 #[derive(Clone)]
 pub enum TokenCustody {
-    /// Server owns one token resolved at startup.
     Server(String),
-    /// http per-request mode: each request must carry the token header.
     PerRequest,
 }
 
 impl Cli {
-    /// Resolve who holds the Jira API token.
-    ///
-    /// # Errors
-    ///
-    /// Mutually exclusive flag combinations, unreadable files, empty token
-    /// files, or stdio without a token source.
     pub fn resolve_token_custody(&self) -> anyhow::Result<TokenCustody> {
         let startup_key = self.api_key.as_deref().filter(|k| !k.is_empty());
         let key_file = self
@@ -193,20 +167,6 @@ impl Cli {
         }
     }
 
-    /// Resolve the Atlassian account email for Cloud Basic auth.
-    ///
-    /// Required whenever the server holds a token (stdio, or http
-    /// server-held). In pure per-request http mode the skeleton still
-    /// accepts a startup email (typical fleet setup: one service account
-    /// email + per-request tokens is unusual; usually both are server-held
-    /// or both follow the same custody). For per-request without email the
-    /// skeleton tools do not call Jira yet, so email may be absent until
-    /// the client layer needs it.
-    ///
-    /// # Errors
-    ///
-    /// Mutually exclusive flag combinations, unreadable files, or stdio /
-    /// server-held mode without an email.
     pub fn resolve_email(&self, token: &TokenCustody) -> anyhow::Result<Option<String>> {
         let startup = self.email.as_deref().filter(|e| !e.is_empty());
         let file = self
@@ -237,8 +197,6 @@ impl Cli {
     }
 }
 
-/// Read a secret file: trim whitespace/newlines; empty is an error. Errors
-/// name the path, never the contents (I12).
 fn read_secret_file(path: &Path, kind: &str) -> anyhow::Result<String> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {kind} file {}", path.display()))?;

@@ -23,7 +23,7 @@ _jirakeep() {
 
     case "${cmd}" in
         jirakeep)
-            opts="-h -V --jira-server --transport --host --port --api-key-header --api-key --api-key-file --email --email-file --read-only --policy --help --version"
+            opts="-h -V --jira-server --transport --host --port --api-key-header --email-header --api-key --api-key-file --email --email-file --read-only --policy --audit-config --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -46,6 +46,10 @@ _jirakeep() {
                     return 0
                     ;;
                 --api-key-header)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --email-header)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -88,6 +92,21 @@ _jirakeep() {
                     return 0
                     ;;
                 --policy)
+                    local oldifs
+                    if [ -n "${IFS+x}" ]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    if [ -n "${oldifs+x}" ]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
+                    return 0
+                    ;;
+                --audit-config)
                     local oldifs
                     if [ -n "${IFS+x}" ]; then
                         oldifs="$IFS"

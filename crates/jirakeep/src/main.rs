@@ -1,14 +1,11 @@
 //! jirakeep — Rust MCP server for Atlassian Jira Cloud with
 //! operator-controlled security guards.
-//!
-//! The binary is a thin transport wrapper; the CLI and the MCP tool surface
-//! live in the `jirakeep` library crate (`config`, `server`) so integration
-//! tests can drive the tools without a process boundary.
 
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use jirakeep::audit::{policy_hash_of, AuditConfig, AuditSink, AuditState, FailMode};
 use jirakeep::config::{Cli, Transport};
 use jirakeep::server;
 use jirakeep_core::guard::Guard;
@@ -26,7 +23,6 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Tracing always goes to stderr: stdout belongs to the stdio transport.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -35,21 +31,61 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
 
-    // Guard policy comes ONLY from the TOML file given at startup (I1);
-    // without one the built-in default policy applies.
     let mut policy = match &cli.policy {
         Some(path) => Policy::load(path)
             .with_context(|| format!("failed to load guard policy from {}", path.display()))?,
         None => Policy::default(),
     };
-    // CLI/env can only tighten policy (I9).
     policy.global.read_only |= cli.read_only;
 
     let jira = Arc::new(server::jira_client(&cli)?);
     let guard = Arc::new(Guard::new(policy));
     let cfg = Arc::new(cli);
-    let server = server::JiraKeep::new(cfg.clone(), guard, jira)
+    let mut server = server::JiraKeep::new(cfg.clone(), guard, jira)
         .context("failed to build the MCP server")?;
+
+    let audit = match &cfg.audit_config {
+        Some(path) => {
+            let audit_cfg = AuditConfig::load(path)?;
+            let fail_mode =
+                FailMode::resolve(audit_cfg.fail_mode, cfg.transport == Transport::Http);
+            let suppressed_ids = audit_cfg.suppressed_ids;
+            let policy_hash = match &cfg.policy {
+                Some(policy_path) => {
+                    let bytes = std::fs::read(policy_path).with_context(|| {
+                        format!(
+                            "failed to read guard policy from {} for the audit digest",
+                            policy_path.display()
+                        )
+                    })?;
+                    Some(policy_hash_of(&bytes))
+                }
+                None => None,
+            };
+            let sink = AuditSink::open(audit_cfg).context("failed to open the audit sink")?;
+            let transport = match cfg.transport {
+                Transport::Stdio => "stdio",
+                Transport::Http => "http",
+            };
+            Some(AuditState::new(
+                sink,
+                fail_mode,
+                policy_hash,
+                suppressed_ids,
+                transport,
+            ))
+        }
+        None => None,
+    };
+    if audit.is_none() && cfg.transport == Transport::Http {
+        tracing::warn!(
+            "auditing is OFF: remote tool calls over http will leave no audit \
+             record — pass --audit-config / JIRAKEEP_AUDIT_CONFIG to enable it"
+        );
+    }
+    if let Some(audit) = audit {
+        server = server.with_audit(audit);
+    }
 
     match cfg.transport {
         Transport::Stdio => {

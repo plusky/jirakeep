@@ -1,0 +1,11 @@
+# Example jirakeep audit configuration.
+# Loaded only when named with --audit-config / JIRAKEEP_AUDIT_CONFIG.
+
+path = "/var/log/jirakeep/audit.jsonl"
+fsync = false
+# open | closed_writes_denials | closed_all
+# (omit to default: open for stdio, closed_all for http)
+# fail_mode = "closed_all"
+rotate_max_bytes = 67108864
+rotate_keep = 8
+suppressed_ids = true

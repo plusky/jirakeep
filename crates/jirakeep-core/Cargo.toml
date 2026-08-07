@@ -27,6 +27,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "query",
     "rustls",
     "system-proxy",
+    "multipart",
 ] }
 
 [dev-dependencies]

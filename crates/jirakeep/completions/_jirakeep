@@ -15,7 +15,9 @@ _jirakeep() {
 
     local context curcontext="$curcontext" state line
     _arguments "${_arguments_options[@]}" : \
-'--jira-server=[Base URL of the Jira Cloud site (e.g. '\''https\://example.atlassian.net'\'')]:JIRA_SERVER:_default' \
+'--jira-server=[Base URL of the Jira site (e.g. '\''https\://example.atlassian.net'\'' or a DC host)]:JIRA_SERVER:_default' \
+'--auth-mode=[Authentication mode\: '\''basic'\'' (Cloud email+token, default) or '\''bearer'\'' (DC PAT)]:AUTH_MODE:((basic\:"Cloud Basic auth\: email + API token (default)"
+bearer\:"Bearer token\: Data Center personal access token (email not required)"))' \
 '--transport=[Transport for the MCP server\: '\''http'\'' (default) or '\''stdio'\'']:TRANSPORT:((http\:"Streamable HTTP transport (default)"
 stdio\:"Stdio transport"))' \
 '--host=[Host address for the MCP server to listen on (http transport only)]:HOST:_default' \

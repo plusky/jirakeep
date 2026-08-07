@@ -6,6 +6,7 @@
 //! - **I5** — restricted comments need policy + per-call opt-in
 
 use std::collections::{BTreeMap, BTreeSet};
+// BTreeSet used for I14 linked/disclosable key sets.
 
 use chrono::Utc;
 use serde_json::{json, Map, Value};
@@ -297,6 +298,178 @@ impl Guard {
     pub fn allows(&self, cap: Capability) -> bool {
         self.policy.default_access().allows(cap)
     }
+
+    /// Collect issue keys referenced from a served issue body (I14 candidates).
+    ///
+    /// Sources: `fields.issuelinks` (inward/outward), `fields.parent`,
+    /// `fields.subtasks`. Free-text description/comments are not scanned.
+    pub fn linked_keys(issue: &Value) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        let fields = issue.get("fields").unwrap_or(issue);
+        if let Some(links) = fields.get("issuelinks").and_then(Value::as_array) {
+            for link in links {
+                for side in ["inwardIssue", "outwardIssue"] {
+                    if let Some(k) = link
+                        .get(side)
+                        .and_then(|i| i.get("key"))
+                        .and_then(Value::as_str)
+                    {
+                        keys.insert(k.to_owned());
+                    }
+                }
+            }
+        }
+        if let Some(k) = fields
+            .get("parent")
+            .and_then(|p| p.get("key"))
+            .and_then(Value::as_str)
+        {
+            keys.insert(k.to_owned());
+        }
+        if let Some(subs) = fields.get("subtasks").and_then(Value::as_array) {
+            for sub in subs {
+                if let Some(k) = sub.get("key").and_then(Value::as_str) {
+                    keys.insert(k.to_owned());
+                }
+            }
+        }
+        keys
+    }
+
+    /// Keys that may appear in a client-visible response (at least Summary).
+    ///
+    /// Failed fetches fail closed: those keys are not disclosable (I4).
+    pub async fn disclosable(
+        &self,
+        jira: &JiraClient,
+        creds: &Credentials,
+        keys: &BTreeSet<String>,
+        caller: Option<&str>,
+    ) -> BTreeSet<String> {
+        if keys.is_empty() {
+            return BTreeSet::new();
+        }
+        let list: Vec<String> = keys.iter().cloned().collect();
+        let assessments = self.assess(jira, creds, &list, caller).await;
+        let mut ok = BTreeSet::new();
+        for key in keys {
+            if assessments
+                .get(key)
+                .or_else(|| {
+                    assessments
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                        .map(|(_, v)| v)
+                })
+                .is_some_and(|(access, _)| access.allows(Capability::Summary))
+            {
+                ok.insert(key.clone());
+            }
+        }
+        ok
+    }
+
+    /// Remove links/parent/subtasks that name non-disclosable issues (I14).
+    ///
+    /// `disclosable` must include keys the client is already allowed to see
+    /// in this response (typically the requested key itself). Returns the
+    /// scrubbed issue and the keys that were removed (server-side only).
+    pub fn scrub_links(issue: &Value, disclosable: &BTreeSet<String>) -> (Value, Vec<String>) {
+        let mut out = issue.clone();
+        let mut scrubbed = Vec::new();
+        let Some(fields) = out.get_mut("fields").and_then(Value::as_object_mut) else {
+            return (out, scrubbed);
+        };
+
+        if let Some(Value::Array(links)) = fields.get_mut("issuelinks") {
+            let before = links.len();
+            links.retain(|link| {
+                for side in ["inwardIssue", "outwardIssue"] {
+                    if let Some(k) = link
+                        .get(side)
+                        .and_then(|i| i.get("key"))
+                        .and_then(Value::as_str)
+                    {
+                        if !disclosable.iter().any(|d| d.eq_ignore_ascii_case(k)) {
+                            scrubbed.push(k.to_owned());
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+            let _ = before;
+        }
+
+        if let Some(parent) = fields.get("parent").cloned() {
+            if let Some(k) = parent.get("key").and_then(Value::as_str) {
+                if !disclosable.iter().any(|d| d.eq_ignore_ascii_case(k)) {
+                    scrubbed.push(k.to_owned());
+                    fields.remove("parent");
+                }
+            }
+        }
+
+        if let Some(Value::Array(subs)) = fields.get_mut("subtasks") {
+            subs.retain(|sub| {
+                if let Some(k) = sub.get("key").and_then(Value::as_str) {
+                    if !disclosable.iter().any(|d| d.eq_ignore_ascii_case(k)) {
+                        scrubbed.push(k.to_owned());
+                        return false;
+                    }
+                }
+                true
+            });
+        }
+
+        scrubbed.sort();
+        scrubbed.dedup();
+        (out, scrubbed)
+    }
+
+    /// Scrub changelog histories that name other issues in `to`/`from` fields.
+    pub fn scrub_changelog(changelog: &Value, disclosable: &BTreeSet<String>) -> Value {
+        let mut out = changelog.clone();
+        let values = if out.get("values").map(Value::is_array).unwrap_or(false) {
+            out.get_mut("values")
+        } else {
+            out.get_mut("histories")
+        };
+        let Some(values) = values.and_then(Value::as_array_mut) else {
+            return out;
+        };
+        for hist in values.iter_mut() {
+            let Some(items) = hist.get_mut("items").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for item in items.iter_mut() {
+                for field in ["fromString", "toString", "from", "to"] {
+                    if let Some(Value::String(s)) = item.get_mut(field) {
+                        // Drop values that look like issue keys and are not disclosable.
+                        if looks_like_issue_key(s)
+                            && !disclosable.iter().any(|d| d.eq_ignore_ascii_case(s))
+                        {
+                            *s = "[redacted]".to_owned();
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Rough issue-key shape: `ABC-123` (project key + hyphen + digits).
+fn looks_like_issue_key(s: &str) -> bool {
+    let s = s.trim();
+    let mut parts = s.splitn(2, '-');
+    let (Some(proj), Some(num)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    !proj.is_empty()
+        && proj.chars().all(|c| c.is_ascii_alphanumeric())
+        && !num.is_empty()
+        && num.chars().all(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -367,5 +540,42 @@ projects = ["SEC"]
         assert_eq!(vis.len(), 1);
         assert_eq!(vis[0]["key"], json!("OPEN-1"));
         assert_eq!(drop, vec!["SEC-1".to_string()]);
+    }
+
+    #[test]
+    fn linked_keys_and_scrub_links() {
+        let issue = json!({
+            "key": "OPEN-1",
+            "fields": {
+                "issuelinks": [
+                    {"outwardIssue": {"key": "OPEN-2"}},
+                    {"inwardIssue": {"key": "SEC-9"}},
+                ],
+                "parent": {"key": "SEC-1"},
+                "subtasks": [{"key": "OPEN-3"}, {"key": "SEC-2"}],
+            }
+        });
+        let keys = Guard::linked_keys(&issue);
+        assert!(keys.contains("SEC-9"));
+        assert!(keys.contains("OPEN-2"));
+        let mut allow = BTreeSet::new();
+        allow.insert("OPEN-1".into());
+        allow.insert("OPEN-2".into());
+        allow.insert("OPEN-3".into());
+        let (scrubbed, removed) = Guard::scrub_links(&issue, &allow);
+        assert!(removed.iter().any(|k| k == "SEC-9"));
+        assert!(removed.iter().any(|k| k == "SEC-1"));
+        assert!(removed.iter().any(|k| k == "SEC-2"));
+        let links = scrubbed["fields"]["issuelinks"].as_array().unwrap();
+        assert_eq!(links.len(), 1);
+        assert!(scrubbed["fields"].get("parent").is_none());
+        assert_eq!(scrubbed["fields"]["subtasks"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn looks_like_issue_key_shape() {
+        assert!(super::looks_like_issue_key("PROJ-123"));
+        assert!(!super::looks_like_issue_key("not a key"));
+        assert!(!super::looks_like_issue_key("PROJ-"));
     }
 }

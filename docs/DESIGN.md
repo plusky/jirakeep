@@ -39,9 +39,11 @@ Dependency direction: `jirakeep -> jirakeep-core`, never the reverse.
 
 ## Backend scope (v1)
 
-- **In scope:** Jira Cloud REST API v3, Basic auth (`email` + API token).
-- **Out of scope for v1:** Jira Data Center / Server, OAuth 2.0, multi-tracker
-  process, Confluence.
+- **In scope:** Jira REST API v3.
+  - **Cloud:** Basic auth (`email` + API token) — default (`--auth-mode basic`).
+  - **Data Center:** Bearer personal access token (`--auth-mode bearer`).
+- **Out of scope for v1:** OAuth 2.0 interactive flows, multi-tracker process,
+  Confluence.
 
 ## Security invariants (normative — reviewers verify these)
 
@@ -85,11 +87,17 @@ Numbering aligns with bugwarden where the spirit matches; wording is Jira-specif
 - **I13** In read-only mode (policy or CLI) write tools are removed from the
   tool listing via `ToolRouter::remove_route`, not merely erroring. Same for
   `global.disabled_tools`.
-- **I14** (planned) Issue keys the policy would deny must not appear inside
-  something the client IS shown (issuelinks, remote links, changelog items
-  naming other issues), with the same bar as bugwarden's link scrubbing.
-- **I15** (planned) The audit stream is never reachable through any MCP
-  surface.
+- **I14** Issue keys the policy would deny must not appear inside something
+  the client IS shown: `issuelinks`, `parent`, `subtasks` on served issues,
+  and changelog `from`/`to`/`fromString`/`toString` values that look like
+  issue keys. Bar is `Capability::Summary`. Candidate keys are assessed in
+  batch via `Guard::disclosable`; failed fetches scrub (I4). Free-text
+  description/comment bodies are not scanned (deliberate, unfixable
+  without destroying content).
+- **I15** The audit stream is never reachable through any MCP surface.
+  Records include tool calls (verdicts, suppressed keys, search scan
+  counts) and `initialize` handshakes. Tokens, emails, and free-text issue
+  content are unrepresentable in the event type.
 
 ## Visibility semantics (Jira-specific — critical)
 

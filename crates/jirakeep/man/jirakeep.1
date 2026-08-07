@@ -6,6 +6,7 @@ jirakeep \- MCP server for Atlassian Jira Cloud with operator\-controlled securi
 .SH SYNOPSIS
 \fBjirakeep\fR
 \fB\-\-jira\-server\fR <JIRA_SERVER>
+[\fB\-\-auth\-mode\fR <AUTH_MODE>]
 [\fB\-\-transport\fR <TRANSPORT>]
 [\fB\-\-host\fR <HOST>]
 [\fB\-\-port\fR <PORT>]
@@ -29,7 +30,20 @@ MCP server for Atlassian Jira Cloud with operator\-controlled security guards
 .SH OPTIONS
 .TP
 \fB\-\-jira\-server\fR \fI<JIRA_SERVER>\fR
-Base URL of the Jira Cloud site (e.g. \*(Aqhttps://example.atlassian.net\*(Aq)
+Base URL of the Jira site (e.g. \*(Aqhttps://example.atlassian.net\*(Aq or a DC host)
+.TP
+\fB\-\-auth\-mode\fR \fI<AUTH_MODE>\fR [default: basic]
+Authentication mode: \*(Aqbasic\*(Aq (Cloud email+token, default) or \*(Aqbearer\*(Aq (DC PAT)
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+basic: Cloud Basic auth: email + API token (default)
+.IP \(bu 2
+bearer: Bearer token: Data Center personal access token (email not required)
+.RE
 .TP
 \fB\-\-transport\fR \fI<TRANSPORT>\fR [default: http]
 Transport for the MCP server: \*(Aqhttp\*(Aq (default) or \*(Aqstdio\*(Aq
@@ -100,6 +114,9 @@ neither is given.
 .TP
 .B JIRA_SERVER
 Fallback for \fB\-\-jira\-server\fR.
+.TP
+.B JIRA_AUTH_MODE
+Fallback for \fB\-\-auth\-mode\fR.
 .TP
 .B MCP_TRANSPORT
 Fallback for \fB\-\-transport\fR.

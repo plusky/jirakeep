@@ -100,6 +100,11 @@ pub struct AuditEvent {
     pub suppressed_keys: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suppressed_count: Option<u64>,
+    /// Search scan accounting (I3: never on the MCP client path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_scanned: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_dropped: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -108,6 +113,12 @@ pub struct AuditEvent {
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +147,8 @@ pub struct AuditCell {
     rule: Mutex<Option<String>>,
     suppressed: Mutex<Vec<String>>,
     suppressed_count: Mutex<Option<u64>>,
+    scan_scanned: Mutex<Option<u64>>,
+    scan_dropped: Mutex<Option<u64>>,
 }
 
 impl AuditCell {
@@ -158,20 +171,38 @@ impl AuditCell {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(n);
     }
-    pub fn snapshot(&self) -> (Option<Verdict>, Option<String>, Vec<String>, Option<u64>) {
-        (
-            *self.verdict.lock().unwrap_or_else(|e| e.into_inner()),
-            self.rule.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-            self.suppressed
+    pub fn note_scan(&self, scanned: u64, dropped: u64) {
+        *self.scan_scanned.lock().unwrap_or_else(|e| e.into_inner()) = Some(scanned);
+        *self.scan_dropped.lock().unwrap_or_else(|e| e.into_inner()) = Some(dropped);
+    }
+    pub fn snapshot(&self) -> AuditCellSnapshot {
+        AuditCellSnapshot {
+            verdict: *self.verdict.lock().unwrap_or_else(|e| e.into_inner()),
+            rule: self.rule.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            suppressed: self
+                .suppressed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-            *self
+            suppressed_count: *self
                 .suppressed_count
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
-        )
+            scan_scanned: *self.scan_scanned.lock().unwrap_or_else(|e| e.into_inner()),
+            scan_dropped: *self.scan_dropped.lock().unwrap_or_else(|e| e.into_inner()),
+        }
     }
+}
+
+/// Snapshot of per-request audit enrichment.
+#[derive(Debug, Default)]
+pub struct AuditCellSnapshot {
+    pub verdict: Option<Verdict>,
+    pub rule: Option<String>,
+    pub suppressed: Vec<String>,
+    pub suppressed_count: Option<u64>,
+    pub scan_scanned: Option<u64>,
+    pub scan_dropped: Option<u64>,
 }
 
 pub struct AuditSink {
@@ -317,11 +348,12 @@ impl AuditState {
         duration_ms: u64,
         error: Option<String>,
     ) -> anyhow::Result<()> {
-        let (verdict, rule, suppressed, count) = cell.snapshot();
-        let suppressed_count =
-            count.or_else(|| (!suppressed.is_empty()).then_some(suppressed.len() as u64));
-        let suppressed_keys = if self.suppressed_ids && !suppressed.is_empty() {
-            Some(suppressed)
+        let snap = cell.snapshot();
+        let suppressed_count = snap
+            .suppressed_count
+            .or_else(|| (!snap.suppressed.is_empty()).then_some(snap.suppressed.len() as u64));
+        let suppressed_keys = if self.suppressed_ids && !snap.suppressed.is_empty() {
+            Some(snap.suppressed)
         } else {
             None
         };
@@ -331,14 +363,55 @@ impl AuditState {
             ts: String::new(),
             kind: "tool_call".into(),
             tool: Some(tool.to_owned()),
-            verdict: verdict.map(|v| v.as_str().to_owned()),
-            rule,
+            verdict: snap.verdict.map(|v| v.as_str().to_owned()),
+            rule: snap.rule,
             suppressed_keys,
             suppressed_count,
+            scan_scanned: snap.scan_scanned,
+            scan_dropped: snap.scan_dropped,
             policy_hash: self.policy_hash.clone(),
             transport: Some(self.transport.clone()),
             duration_ms: Some(duration_ms),
             error,
+            client_name: None,
+            client_version: None,
+            protocol_version: None,
+        };
+        match self.sink.record(event) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.sink.mark_failing();
+                Err(e)
+            }
+        }
+    }
+
+    /// Record an MCP `initialize` handshake (session start).
+    pub fn record_initialize(
+        &self,
+        client_name: Option<String>,
+        client_version: Option<String>,
+        protocol_version: Option<String>,
+    ) -> anyhow::Result<()> {
+        let event = AuditEvent {
+            v: SCHEMA_VERSION,
+            seq: 0,
+            ts: String::new(),
+            kind: "initialize".into(),
+            tool: None,
+            verdict: None,
+            rule: None,
+            suppressed_keys: None,
+            suppressed_count: None,
+            scan_scanned: None,
+            scan_dropped: None,
+            policy_hash: self.policy_hash.clone(),
+            transport: Some(self.transport.clone()),
+            duration_ms: None,
+            error: None,
+            client_name,
+            client_version,
+            protocol_version,
         };
         match self.sink.record(event) {
             Ok(()) => Ok(()),
@@ -387,10 +460,15 @@ mod tests {
             rule: None,
             suppressed_keys: None,
             suppressed_count: None,
+            scan_scanned: None,
+            scan_dropped: None,
             policy_hash: None,
             transport: Some("stdio".into()),
             duration_ms: Some(1),
             error: None,
+            client_name: None,
+            client_version: None,
+            protocol_version: None,
         })
         .unwrap();
         let text = std::fs::read_to_string(path).unwrap();

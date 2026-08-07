@@ -17,13 +17,36 @@ pub enum Transport {
     Stdio,
 }
 
-/// MCP server for Atlassian Jira Cloud with operator-controlled security guards.
+/// How jirakeep authenticates to Jira.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum AuthModeCli {
+    /// Cloud Basic auth: email + API token (default).
+    #[default]
+    Basic,
+    /// Bearer token: Data Center personal access token (email not required).
+    Bearer,
+}
+
+impl From<AuthModeCli> for jirakeep_core::client::AuthMode {
+    fn from(value: AuthModeCli) -> Self {
+        match value {
+            AuthModeCli::Basic => jirakeep_core::client::AuthMode::Basic,
+            AuthModeCli::Bearer => jirakeep_core::client::AuthMode::Bearer,
+        }
+    }
+}
+
+/// MCP server for Atlassian Jira with operator-controlled security guards.
 #[derive(Parser)]
 #[command(name = "jirakeep", version, about)]
 pub struct Cli {
-    /// Base URL of the Jira Cloud site (e.g. 'https://example.atlassian.net').
+    /// Base URL of the Jira site (e.g. 'https://example.atlassian.net' or a DC host).
     #[arg(long, env = "JIRA_SERVER")]
     pub jira_server: String,
+
+    /// Authentication mode: 'basic' (Cloud email+token, default) or 'bearer' (DC PAT).
+    #[arg(long, env = "JIRA_AUTH_MODE", value_enum, default_value = "basic")]
+    pub auth_mode: AuthModeCli,
 
     /// Transport for the MCP server: 'http' (default) or 'stdio'.
     #[arg(long, env = "MCP_TRANSPORT", value_enum, default_value = "http")]
@@ -89,6 +112,7 @@ impl std::fmt::Debug for Cli {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cli")
             .field("jira_server", &self.jira_server)
+            .field("auth_mode", &self.auth_mode)
             .field("transport", &self.transport)
             .field("host", &self.host)
             .field("port", &self.port)
@@ -185,11 +209,16 @@ impl Cli {
             startup.map(str::to_owned)
         };
 
+        // Bearer (DC PAT) never needs an email.
+        if self.auth_mode == AuthModeCli::Bearer {
+            return Ok(email);
+        }
+
         match token {
             TokenCustody::Server(_) if email.is_none() => {
                 anyhow::bail!(
                     "Cloud Basic auth requires --email / JIRA_EMAIL or --email-file \
-                     when a server-held API token is configured"
+                     when a server-held API token is configured (or use --auth-mode bearer)"
                 );
             }
             _ => Ok(email),
@@ -284,6 +313,23 @@ mod tests {
             cli.resolve_email(&tok).unwrap().as_deref(),
             Some("user@example.com")
         );
+    }
+
+    #[test]
+    fn bearer_stdio_token_without_email() {
+        let cli = parse(&[
+            "--jira-server",
+            "https://jira.example.com",
+            "--transport",
+            "stdio",
+            "--auth-mode",
+            "bearer",
+            "--api-key",
+            "pat-token",
+        ]);
+        let tok = cli.resolve_token_custody().unwrap();
+        assert!(matches!(tok, TokenCustody::Server(_)));
+        assert!(cli.resolve_email(&tok).unwrap().is_none());
     }
 
     #[test]

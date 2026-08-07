@@ -1,11 +1,13 @@
-//! Async Jira Cloud REST client.
+//! Async Jira REST client (Cloud and Data Center).
 //!
-//! Authentication is Cloud Basic auth: `email` + API token, applied per
-//! request so the client never stores secrets. Errors are sanitized so
-//! credentials cannot leak (I12).
+//! Authentication is applied per request so the client never stores secrets.
+//! Modes:
+//! - **Basic** — Cloud email + API token
+//! - **Bearer** — Data Center personal access token (or Cloud OAuth bearer)
 //!
-//! The `User-Agent` is supplied by the caller (the binary), never derived
-//! from this crate's package name.
+//! Errors are sanitized so credentials cannot leak (I12). The `User-Agent`
+//! is supplied by the caller (the binary), never derived from this crate's
+//! package name.
 
 use std::time::Duration;
 
@@ -14,9 +16,22 @@ use serde_json::{json, Value};
 
 /// Fields fetched for guard classification of an issue.
 pub const CLASSIFY_FIELDS: &str =
-    "summary,project,status,priority,issuetype,labels,components,security,created,reporter,assignee";
+    "summary,project,status,priority,issuetype,labels,components,security,created,reporter,assignee,issuelinks,parent,subtasks";
 
-/// Credentials for one Jira Cloud request (Basic auth).
+/// How credentials are attached to each request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthMode {
+    /// `Authorization: Basic base64(email:token)` — Jira Cloud API tokens.
+    #[default]
+    Basic,
+    /// `Authorization: Bearer <token>` — Jira Data Center PATs (and similar).
+    Bearer,
+}
+
+/// Credentials for one Jira request.
+///
+/// For [`AuthMode::Basic`], `email` must be non-empty. For
+/// [`AuthMode::Bearer`], `email` is ignored (may be empty).
 #[derive(Clone)]
 pub struct Credentials {
     pub email: String,
@@ -33,17 +48,23 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
-/// Async client for the Jira Cloud REST API v3.
+/// Async client for the Jira REST API v3.
 #[derive(Debug, Clone)]
 pub struct JiraClient {
     base_url: String,
     api_url: String,
     http: reqwest::Client,
+    auth_mode: AuthMode,
 }
 
 impl JiraClient {
-    /// Create a client for the Jira Cloud site at `base_url`.
+    /// Create a client for the Jira site at `base_url` (Cloud Basic auth).
     pub fn new(base_url: &str, user_agent: &str) -> Result<Self> {
+        Self::with_auth_mode(base_url, user_agent, AuthMode::Basic)
+    }
+
+    /// Create a client with an explicit auth mode (Cloud Basic or DC Bearer).
+    pub fn with_auth_mode(base_url: &str, user_agent: &str, auth_mode: AuthMode) -> Result<Self> {
         if user_agent.trim().is_empty() {
             bail!("jira client: user_agent must name the calling program, and was blank");
         }
@@ -61,7 +82,12 @@ impl JiraClient {
             base_url,
             api_url,
             http,
+            auth_mode,
         })
+    }
+
+    pub fn auth_mode(&self) -> AuthMode {
+        self.auth_mode
     }
 
     pub fn base_url(&self) -> &str {
@@ -256,10 +282,7 @@ impl JiraClient {
                 }
             )
         };
-        let rb = self
-            .http
-            .get(&url)
-            .basic_auth(&creds.email, Some(&creds.token));
+        let rb = self.apply_auth(self.http.get(&url), creds);
         let resp = rb.send().await.map_err(sanitize)?;
         let status = resp.status();
         if !status.is_success() {
@@ -345,13 +368,14 @@ impl JiraClient {
     ) -> Result<()> {
         let path = format!("/issue/{}/watchers", urlencoding_path(key_or_id));
         // Body is a JSON string of the account id.
-        let rb = self
-            .http
-            .post(format!("{}{}", self.api_url, path))
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .basic_auth(&creds.email, Some(&creds.token))
-            .body(format!("\"{account_id}\""));
+        let rb = self.apply_auth(
+            self.http
+                .post(format!("{}{}", self.api_url, path))
+                .header(reqwest::header::ACCEPT, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(format!("\"{account_id}\"")),
+            creds,
+        );
         let (status, body) = self.send(rb, "POST", &path).await?;
         if status.as_u16() == 204 || status.is_success() {
             return Ok(());
@@ -373,13 +397,14 @@ impl JiraClient {
             .mime_str("application/octet-stream")
             .map_err(|e| anyhow!("attachment part: {e}"))?;
         let form = reqwest::multipart::Form::new().part("file", part);
-        let rb = self
-            .http
-            .post(format!("{}{}", self.api_url, path))
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header("X-Atlassian-Token", "no-check")
-            .basic_auth(&creds.email, Some(&creds.token))
-            .multipart(form);
+        let rb = self.apply_auth(
+            self.http
+                .post(format!("{}{}", self.api_url, path))
+                .header(reqwest::header::ACCEPT, "application/json")
+                .header("X-Atlassian-Token", "no-check")
+                .multipart(form),
+            creds,
+        );
         let (status, body) = self.send(rb, "POST", &path).await?;
         parse_response(status, &body)
     }
@@ -389,7 +414,13 @@ impl JiraClient {
         rb: reqwest::RequestBuilder,
         creds: &Credentials,
     ) -> reqwest::RequestBuilder {
-        rb.basic_auth(&creds.email, Some(&creds.token))
+        match self.auth_mode {
+            AuthMode::Basic => rb.basic_auth(&creds.email, Some(&creds.token)),
+            AuthMode::Bearer => rb.header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", creds.token),
+            ),
+        }
     }
 
     async fn send(

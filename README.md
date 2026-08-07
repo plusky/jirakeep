@@ -25,7 +25,10 @@ repository so tracker-specific invariants stay honest. See
   transitions, assign, field update, watchers, links, create, attach.
 * **Audit stream** — operator-only JSONL (`--audit-config`); never on MCP.
 * **Two transports** — streamable HTTP and stdio.
-* **Cloud Basic auth** — email + API token (server-held or per-request headers).
+* **Auth** — Cloud Basic (email + API token) or Data Center Bearer PAT
+  (`--auth-mode bearer`).
+* **I14 link scrubbing** — denied issue keys removed from links/parent/subtasks
+  and redacted in changelog strings.
 
 ## Tools
 
@@ -71,6 +74,14 @@ cargo build --release -p jirakeep
   --jira-server https://example.atlassian.net \
   --email you@example.com \
   --api-key "$JIRA_API_TOKEN" \
+  --policy examples/policy.toml
+
+# Data Center personal access token (Bearer)
+./target/release/jirakeep \
+  --transport stdio \
+  --auth-mode bearer \
+  --jira-server https://jira.example.com \
+  --api-key "$JIRA_PAT" \
   --policy examples/policy.toml
 ```
 

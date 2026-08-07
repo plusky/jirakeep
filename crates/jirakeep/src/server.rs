@@ -59,7 +59,10 @@ pub const WRITE_TOOLS: &[&str] = &[
 
 pub fn jira_client(cli: &Cli) -> anyhow::Result<JiraClient> {
     use anyhow::Context as _;
-    JiraClient::new(&cli.jira_server, USER_AGENT).context("failed to build Jira client")
+    use jirakeep_core::client::AuthMode;
+    let mode: AuthMode = cli.auth_mode.into();
+    JiraClient::with_auth_mode(&cli.jira_server, USER_AGENT, mode)
+        .context("failed to build Jira client")
 }
 
 fn ok_json(value: Value) -> CallToolResult {
@@ -265,6 +268,7 @@ impl JiraKeep {
     }
 
     fn credentials(&self, ctx: &RequestContext<RoleServer>) -> Result<Credentials, McpError> {
+        use crate::config::AuthModeCli;
         let token = match &self.token_custody {
             TokenCustody::Server(t) => t.clone(),
             TokenCustody::PerRequest => {
@@ -283,26 +287,31 @@ impl JiraKeep {
                     })?
             }
         };
-        let email = match &self.email {
-            Some(e) => e.clone(),
-            None => {
-                // Per-request email header for multi-user Cloud Basic.
-                let header = self.cfg.email_header.to_lowercase();
-                ctx.extensions
-                    .get::<axum::http::request::Parts>()
-                    .and_then(|parts| parts.headers.get(header.as_str()))
-                    .and_then(|v| v.to_str().ok())
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_owned)
-                    .ok_or_else(|| {
-                        McpError::invalid_request(
-                            format!(
-                                "email required: set --email or send `{}` header",
-                                self.cfg.email_header
-                            ),
-                            None,
-                        )
-                    })?
+        let email = if self.cfg.auth_mode == AuthModeCli::Bearer {
+            self.email.clone().unwrap_or_default()
+        } else {
+            match &self.email {
+                Some(e) => e.clone(),
+                None => {
+                    // Per-request email header for multi-user Cloud Basic.
+                    let header = self.cfg.email_header.to_lowercase();
+                    ctx.extensions
+                        .get::<axum::http::request::Parts>()
+                        .and_then(|parts| parts.headers.get(header.as_str()))
+                        .and_then(|v| v.to_str().ok())
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            McpError::invalid_request(
+                                format!(
+                                    "email required: set --email or send `{}` header \
+                                     (or --auth-mode bearer for DC PAT)",
+                                    self.cfg.email_header
+                                ),
+                                None,
+                            )
+                        })?
+                }
             }
         };
         Ok(Credentials { email, token })
@@ -363,7 +372,10 @@ impl JiraKeep {
         Ok(ok_json(json!({
             "name": SERVER_NAME,
             "version": SERVER_VERSION,
-            "backend": "jira-cloud",
+            "backend": match self.cfg.auth_mode {
+                crate::config::AuthModeCli::Basic => "jira-cloud-basic",
+                crate::config::AuthModeCli::Bearer => "jira-bearer",
+            },
             "jira_server": self.cfg.jira_server,
             "transport": match self.cfg.transport {
                 Transport::Http => "http",
@@ -427,10 +439,35 @@ impl JiraKeep {
             .await;
         let mut issues = Vec::new();
         let mut restricted = Vec::new();
+        let mut all_scrubbed: Vec<String> = Vec::new();
         for key in &keys {
             match assessments.get(key) {
                 Some((access, body)) if !body.is_null() => {
-                    if let Some(proj) = Guard::project_issue(access, body) {
+                    if access.allows(Capability::Read) {
+                        // Full body for Read grants (classify fetch is a projection).
+                        let full = match self.jira.get_issue(&creds, key, None).await {
+                            Ok(v) => v,
+                            Err(_) => body.clone(),
+                        };
+                        // I14: scrub linked keys the client may not see.
+                        let mut candidates = Guard::linked_keys(&full);
+                        candidates.insert(key.clone());
+                        let disclosable = self
+                            .guard
+                            .disclosable(&self.jira, &creds, &candidates, caller.as_deref())
+                            .await;
+                        let (scrubbed, removed) = Guard::scrub_links(&full, &disclosable);
+                        all_scrubbed.extend(removed);
+                        if let Some(cell) = audit_cell(&ctx) {
+                            cell.note_verdict_rule(
+                                Verdict::Served,
+                                match access {
+                                    Access::Denied { rule } | Access::Granted { rule, .. } => rule,
+                                },
+                            );
+                        }
+                        issues.push(scrubbed);
+                    } else if let Some(proj) = Guard::project_issue(access, body) {
                         if let Some(cell) = audit_cell(&ctx) {
                             cell.note_verdict_rule(
                                 Verdict::Served,
@@ -451,6 +488,9 @@ impl JiraKeep {
             if !restricted.is_empty() {
                 cell.note_suppressed(restricted.clone());
                 cell.note_suppressed_count(restricted.len() as u64);
+            }
+            if !all_scrubbed.is_empty() {
+                cell.note_suppressed(all_scrubbed);
             }
         }
         Ok(ok_json(json!({
@@ -522,7 +562,36 @@ impl JiraKeep {
             .issue_changelog(&creds, &p.key, 0, p.max_results.min(100))
             .await
         {
-            Ok(v) => Ok(ok_json(v)),
+            Ok(v) => {
+                // I14: redact issue-key values in changelog that policy hides.
+                use std::collections::BTreeSet;
+                let mut candidates = BTreeSet::new();
+                candidates.insert(p.key.clone());
+                if let Some(values) = v
+                    .get("values")
+                    .or_else(|| v.get("histories"))
+                    .and_then(Value::as_array)
+                {
+                    for hist in values {
+                        if let Some(items) = hist.get("items").and_then(Value::as_array) {
+                            for item in items {
+                                for field in ["fromString", "toString", "from", "to"] {
+                                    if let Some(s) = item.get(field).and_then(Value::as_str) {
+                                        if s.contains('-') {
+                                            candidates.insert(s.to_owned());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let disclosable = self
+                    .guard
+                    .disclosable(&self.jira, &creds, &candidates, caller.as_deref())
+                    .await;
+                Ok(ok_json(Guard::scrub_changelog(&v, &disclosable)))
+            }
             Err(_) => Ok(err_text(Guard::denial(&p.key))),
         }
     }
@@ -556,6 +625,7 @@ impl JiraKeep {
                     cell.note_verdict(Verdict::Filtered);
                     cell.note_suppressed(window.dropped_keys.clone());
                     cell.note_suppressed_count(window.dropped_keys.len() as u64);
+                    cell.note_scan(u64::from(window.scanned), window.dropped_keys.len() as u64);
                 }
                 // I3: do not return scanned/dropped counts to the client.
                 Ok(ok_json(json!({
@@ -1041,16 +1111,42 @@ impl ServerHandler for JiraKeep {
             .with_protocol_version(DEFAULT_PROTOCOL_VERSION)
             .with_server_info(server_identity())
             .with_instructions(
-                "MCP server for Atlassian Jira Cloud with operator-controlled \
+                "MCP server for Atlassian Jira with operator-controlled \
                  security guards. Policy-denied issues are indistinguishable from \
                  nonexistent ones: 'Issue {key} is not accessible through this server'. \
-                 Search silently omits denied issues. Restricted comments need dual opt-in."
+                 Search silently omits denied issues. Restricted comments need dual opt-in. \
+                 Linked issue keys the policy would hide are scrubbed from responses."
                     .to_string(),
             )
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        context.peer.set_peer_info(request.clone());
+        let mut info = self.get_info();
+        if SUPPORTED_PROTOCOL_VERSIONS.contains(&request.protocol_version) {
+            info.protocol_version = request.protocol_version.clone();
+        }
+        if let Some(audit) = &self.audit {
+            if let Err(e) = audit.record_initialize(
+                Some(request.client_info.name.clone()),
+                Some(request.client_info.version.clone()),
+                Some(info.protocol_version.as_str().to_string()),
+            ) {
+                tracing::error!(error = %e, "audit initialize record failed");
+                if audit.fail_mode == FailMode::ClosedAll {
+                    return Err(McpError::internal_error("audit unavailable", None));
+                }
+            }
+        }
+        Ok(info)
     }
 
     async fn call_tool(
@@ -1117,8 +1213,10 @@ mod tests {
     use jirakeep_core::policy::Policy;
 
     fn test_server(read_only: bool) -> JiraKeep {
+        use crate::config::AuthModeCli;
         let cli = Arc::new(Cli {
             jira_server: "https://example.atlassian.net".into(),
+            auth_mode: AuthModeCli::Basic,
             transport: Transport::Http,
             host: "127.0.0.1".into(),
             port: 8000,

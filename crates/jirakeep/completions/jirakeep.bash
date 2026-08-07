@@ -23,7 +23,7 @@ _jirakeep() {
 
     case "${cmd}" in
         jirakeep)
-            opts="-h -V --jira-server --transport --host --port --api-key-header --email-header --api-key --api-key-file --email --email-file --read-only --policy --audit-config --help --version"
+            opts="-h -V --jira-server --auth-mode --transport --host --port --api-key-header --email-header --api-key --api-key-file --email --email-file --read-only --policy --audit-config --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -31,6 +31,10 @@ _jirakeep() {
             case "${prev}" in
                 --jira-server)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --auth-mode)
+                    COMPREPLY=($(compgen -W "basic bearer" -- "${cur}"))
                     return 0
                     ;;
                 --transport)

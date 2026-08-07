@@ -1,0 +1,158 @@
+.TH jirakeep 1 "" "jirakeep 0.1.0" "General Commands Manual"
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH NAME
+jirakeep \- MCP server for Atlassian Jira Cloud with operator\-controlled security guards
+.SH SYNOPSIS
+\fBjirakeep\fR
+\fB\-\-jira\-server\fR <JIRA_SERVER>
+[\fB\-\-transport\fR <TRANSPORT>]
+[\fB\-\-host\fR <HOST>]
+[\fB\-\-port\fR <PORT>]
+[\fB\-\-api\-key\-header\fR <API_KEY_HEADER>]
+[\fB\-\-api\-key\fR <API_KEY>]
+[\fB\-\-api\-key\-file\fR <API_KEY_FILE>]
+[\fB\-\-email\fR <EMAIL>]
+[\fB\-\-email\-file\fR <EMAIL_FILE>]
+[\fB\-\-read\-only\fR]
+[\fB\-\-policy\fR <POLICY>]
+[\fB\-h\fR|\fB\-\-help\fR]
+[\fB\-V\fR|\fB\-\-version\fR]
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH DESCRIPTION
+MCP server for Atlassian Jira Cloud with operator\-controlled security guards
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH OPTIONS
+.TP
+\fB\-\-jira\-server\fR \fI<JIRA_SERVER>\fR
+Base URL of the Jira Cloud site (e.g. \*(Aqhttps://example.atlassian.net\*(Aq). Environment variable JIRA_SERVER is used if the argument is not provided
+.TP
+\fB\-\-transport\fR \fI<TRANSPORT>\fR [default: http]
+Transport for the MCP server: \*(Aqhttp\*(Aq (default) or \*(Aqstdio\*(Aq. Environment variable MCP_TRANSPORT can also be used
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+http: Streamable HTTP transport (default). Clients send the Jira API token per\-request via the API key header, unless `\-\-api\-key\-file` selects server\-held token mode (then the header is not consulted at all)
+.IP \(bu 2
+stdio: Stdio transport. Token and email come from flags/env/files at startup
+.RE
+.TP
+\fB\-\-host\fR \fI<HOST>\fR [default: 127.0.0.1]
+Host address for the MCP server to listen on (http transport only). Defaults to 127.0.0.1 or the MCP_HOST environment variable
+.TP
+\fB\-\-port\fR \fI<PORT>\fR [default: 8000]
+Port for the MCP server to listen on (http transport only). Defaults to 8000 or the MCP_PORT environment variable
+.TP
+\fB\-\-api\-key\-header\fR \fI<API_KEY_HEADER>\fR [default: ApiKey]
+HTTP header for clients to send the Jira API token. Defaults to \*(AqApiKey\*(Aq or the MCP_API_KEY_HEADER environment variable. Not consulted in server\-held token mode (\-\-api\-key\-file over http)
+.TP
+\fB\-\-api\-key\fR \fI<API_KEY>\fR
+Jira Cloud API token. Required for \-\-transport stdio unless \-\-api\-key\-file provides it. Environment variable JIRA_API_TOKEN can also be used. Ignored for \-\-transport http unless \-\-api\-key\-file is set (clients send the token per\-request; use \-\-api\-key\-file for a server\-held token)
+.TP
+\fB\-\-api\-key\-file\fR \fI<API_KEY_FILE>\fR
+Path to a file holding the Jira Cloud API token. Mutually exclusive with \-\-api\-key. Over http this selects server\-held token mode
+.TP
+\fB\-\-email\fR \fI<EMAIL>\fR
+Atlassian account email for Cloud Basic auth. Environment variable JIRA_EMAIL can also be used. Required whenever a token is used (stdio, or http server\-held mode)
+.TP
+\fB\-\-email\-file\fR \fI<EMAIL_FILE>\fR
+Path to a file holding the Atlassian account email. Mutually exclusive with \-\-email
+.TP
+\fB\-\-read\-only\fR
+Disables all tools which modify Jira state. Environment variable MCP_READ_ONLY=true can also be used. Can only tighten the guard policy, never loosen it
+.TP
+\fB\-\-policy\fR \fI<POLICY>\fR
+Path to the guard policy TOML file. Environment variable JIRAKEEP_POLICY can also be used. Without it an allow\-all default policy is used (restricted comments still off)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH EXIT STATUS
+.TP
+.B 0
+Clean shutdown.
+.TP
+.B 1
+Startup or runtime failure: an unreadable policy, a key/email
+misconfiguration, a Jira client or transport error.
+.TP
+.B 2
+Command\-line usage error.
+.SH ENVIRONMENT
+Each variable is the fallback for one option; a command\-line argument
+always wins over the environment, and the built\-in default applies when
+neither is given.
+.TP
+.B JIRA_SERVER
+Fallback for \fB\-\-jira\-server\fR.
+.TP
+.B MCP_TRANSPORT
+Fallback for \fB\-\-transport\fR.
+.TP
+.B MCP_HOST
+Fallback for \fB\-\-host\fR.
+.TP
+.B MCP_PORT
+Fallback for \fB\-\-port\fR.
+.TP
+.B MCP_API_KEY_HEADER
+Fallback for \fB\-\-api\-key\-header\fR.
+.TP
+.B JIRA_API_TOKEN
+Fallback for \fB\-\-api\-key\fR.
+.TP
+.B JIRA_API_TOKEN_FILE
+Fallback for \fB\-\-api\-key\-file\fR.
+.TP
+.B JIRA_EMAIL
+Fallback for \fB\-\-email\fR.
+.TP
+.B JIRA_EMAIL_FILE
+Fallback for \fB\-\-email\-file\fR.
+.TP
+.B MCP_READ_ONLY
+Fallback for \fB\-\-read\-only\fR.
+.TP
+.B JIRAKEEP_POLICY
+Fallback for \fB\-\-policy\fR.
+.SH FILES
+.TP
+.I /etc/jirakeep/policy.toml
+Worked example guard policy as installed by distribution packages; the
+source tree and release archives ship it as
+.IR examples/policy.toml .
+The server reads a policy only when one is named with
+.B \-\-policy
+or
+.BR JIRAKEEP_POLICY ;
+without one the built\-in allow\-all default policy applies.
+.SH EXAMPLES
+Serve a local MCP client over stdio:
+.PP
+.RS 4
+.nf
+jirakeep \-\-transport stdio \e
+    \-\-jira\-server https://example.atlassian.net \e
+    \-\-email user@example.com \e
+    \-\-api\-key\-file ~/.config/jirakeep/api\-token \e
+    \-\-policy /etc/jirakeep/policy.toml
+.fi
+.RE
+.PP
+Listen on HTTP (default, 127.0.0.1:8000), each client presenting its own
+token in the API key header (email still required once issue tools call
+Jira with Basic auth — use server\-held mode for a full credential pair):
+.PP
+.RS 4
+.nf
+jirakeep \-\-jira\-server https://example.atlassian.net \e
+    \-\-policy /etc/jirakeep/policy.toml
+.fi
+.RE

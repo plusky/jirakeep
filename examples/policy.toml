@@ -1,0 +1,36 @@
+# Example jirakeep guard policy.
+#
+# Loaded only when named with --policy / JIRAKEEP_POLICY.
+# Unknown keys are a startup error (strict TOML).
+#
+# Skeleton note: rule match criteria are accepted and counted but not yet
+# evaluated — classification uses default_action only until Phase 1.
+# Visibility: list public project keys under global.public_projects; never
+# assume "no security level" means world-readable (see docs/DESIGN.md).
+
+default_action = "allow"
+
+[global]
+min_issue_age_days = 0
+allow_restricted_comments = false
+read_only = false
+disabled_tools = []
+max_attachment_bytes = 2097152
+# Project keys the operator asserts are publicly browsable.
+public_projects = []
+
+# Hide a security project entirely (intended once matching lands).
+# [[rule]]
+# name = "hide-sec-project"
+# description = "security project is invisible to the agent"
+# action = "deny"
+# [rule.match]
+# projects = ["SEC", "SECURITY"]
+
+# Summaries only on an internal project (intended once matching lands).
+# [[rule]]
+# name = "internal-summaries"
+# action = "restrict"
+# capabilities = ["summary", "comments"]
+# [rule.match]
+# projects = ["INTERNAL*"]

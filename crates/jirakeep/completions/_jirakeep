@@ -1,0 +1,47 @@
+#compdef jirakeep
+
+autoload -U is-at-least
+
+_jirakeep() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--jira-server=[Base URL of the Jira Cloud site (e.g. '\''https\://example.atlassian.net'\''). Environment variable JIRA_SERVER is used if the argument is not provided]:JIRA_SERVER:_default' \
+'--transport=[Transport for the MCP server\: '\''http'\'' (default) or '\''stdio'\''. Environment variable MCP_TRANSPORT can also be used]:TRANSPORT:((http\:"Streamable HTTP transport (default). Clients send the Jira API token per-request via the API key header, unless \`--api-key-file\` selects server-held token mode (then the header is not consulted at all)"
+stdio\:"Stdio transport. Token and email come from flags/env/files at startup"))' \
+'--host=[Host address for the MCP server to listen on (http transport only). Defaults to 127.0.0.1 or the MCP_HOST environment variable]:HOST:_default' \
+'--port=[Port for the MCP server to listen on (http transport only). Defaults to 8000 or the MCP_PORT environment variable]:PORT:_default' \
+'--api-key-header=[HTTP header for clients to send the Jira API token. Defaults to '\''ApiKey'\'' or the MCP_API_KEY_HEADER environment variable. Not consulted in server-held token mode (--api-key-file over http)]:API_KEY_HEADER:_default' \
+'--api-key=[Jira Cloud API token. Required for --transport stdio unless --api-key-file provides it. Environment variable JIRA_API_TOKEN can also be used. Ignored for --transport http unless --api-key-file is set (clients send the token per-request; use --api-key-file for a server-held token)]:API_KEY:_default' \
+'--api-key-file=[Path to a file holding the Jira Cloud API token. Mutually exclusive with --api-key. Over http this selects server-held token mode]:API_KEY_FILE:_files' \
+'--email=[Atlassian account email for Cloud Basic auth. Environment variable JIRA_EMAIL can also be used. Required whenever a token is used (stdio, or http server-held mode)]:EMAIL:_default' \
+'--email-file=[Path to a file holding the Atlassian account email. Mutually exclusive with --email]:EMAIL_FILE:_files' \
+'--policy=[Path to the guard policy TOML file. Environment variable JIRAKEEP_POLICY can also be used. Without it an allow-all default policy is used (restricted comments still off)]:POLICY:_files' \
+'--read-only[Disables all tools which modify Jira state. Environment variable MCP_READ_ONLY=true can also be used. Can only tighten the guard policy, never loosen it]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+&& ret=0
+}
+
+(( $+functions[_jirakeep_commands] )) ||
+_jirakeep_commands() {
+    local commands; commands=()
+    _describe -t commands 'jirakeep commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_jirakeep" ]; then
+    _jirakeep "$@"
+else
+    compdef _jirakeep jirakeep
+fi

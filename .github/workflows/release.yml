@@ -1,0 +1,150 @@
+---
+name: release
+# yamllint disable-line rule:truthy
+on:
+  push:
+    tags:
+      # Version tags: 0.1.0, optionally with a pre-release suffix (0.1.0rc1).
+      # The project tags without a "v" prefix.
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.triple }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Build every platform even if one fails, so a single broken target
+      # surfaces on its own. The release job needs all legs to succeed, so a
+      # failure still blocks publishing a partial set of artifacts.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+          - os: macos-latest  # Apple Silicon
+            triple: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: "1.97.0"
+      # No cargo cache here: releases are built hermetically so restored
+      # build state can never influence published artifacts.
+
+      - name: Verify tag matches workspace version
+        shell: bash
+        run: |
+          pkg="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$pkg" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' != workspace version '$pkg'"
+            exit 1
+          fi
+
+      - name: Build release binary
+        run: cargo build --release --locked -p jirakeep
+
+      - name: Package release artifact
+        shell: bash
+        run: |
+          triple="${{ matrix.triple }}"
+          dist="jirakeep-${GITHUB_REF_NAME}-${triple}"
+          mkdir "$dist"
+          cp target/release/jirakeep LICENSE README.md "$dist/"
+          mkdir "$dist/examples"
+          cp examples/policy.toml "$dist/examples/"
+          # Committed generated assets, kept in sync by the rust-assets-drift
+          # CI job (`cp -R` exists on both the ubuntu and macOS runners).
+          cp -R crates/jirakeep/man crates/jirakeep/completions "$dist/"
+          tar czf "${dist}.tar.gz" "$dist"
+          # shasum -a 256 exists on both the ubuntu and macOS runners and its
+          # output is compatible with `sha256sum -c`.
+          shasum -a 256 "${dist}.tar.gz" >"${dist}.tar.gz.sha256"
+          echo "DIST=$dist" >>"$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ matrix.triple }}
+          path: |
+            ${{ env.DIST }}.tar.gz
+            ${{ env.DIST }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    # Publish only after every platform built successfully, so a release never
+    # ships a partial artifact set.
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # required for `gh release create`
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so tell gh which repo to act on.
+          GH_REPO: ${{ github.repository }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
+          dist/*
+
+  publish:
+    # crates.io last: a version can be yanked but never replaced, so it only
+    # goes out once every platform built and the GitHub release exists.
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Trusted Publishing exchanges this OIDC token for a short-lived
+      # crates.io token, so no registry credential is stored in the repo.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: "1.97.0"
+
+      - name: Authenticate to crates.io
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18  # v1.0.5
+        id: auth
+
+      - name: Publish crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$GITHUB_REF_NAME"
+          # jirakeep-core first: the binary crate resolves its dependency
+          # from the index and cannot even be packaged before core is there.
+          for crate in jirakeep-core jirakeep; do
+            # Re-running a release must not fail on a version already up.
+            if curl -sSf -H 'User-Agent: jirakeep-release' \
+                 "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null 2>&1; then
+              echo "::notice::${crate} ${version} is already published, skipping"
+              continue
+            fi
+            cargo publish --locked -p "$crate"
+          done

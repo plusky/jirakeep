@@ -264,12 +264,38 @@ impl JiraClient {
     }
 
     /// Download attachment content by content URL (absolute or relative).
+    ///
+    /// Relative URLs resolve against the configured base URL. An absolute URL
+    /// is honored only when its origin (scheme + host + port) equals the base
+    /// URL's origin; any other target is refused with a generic error before
+    /// any request is made, so the caller's credentials are only ever sent to
+    /// the operator's configured Jira origin (I12 spirit: token custody).
     pub async fn download_attachment_bytes(
         &self,
         creds: &Credentials,
         content_url: &str,
     ) -> Result<Vec<u8>> {
-        let url = if content_url.starts_with("http://") || content_url.starts_with("https://") {
+        let url = self.same_origin_content_url(content_url)?;
+        let rb = self.apply_auth(self.http.get(url), creds);
+        let resp = rb.send().await.map_err(sanitize)?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("jira attachment download error (HTTP {})", status.as_u16());
+        }
+        resp.bytes().await.map(|b| b.to_vec()).map_err(sanitize)
+    }
+
+    /// Resolve an attachment content URL and enforce that it stays on the
+    /// configured base URL's origin (scheme + host + port). Fails closed with
+    /// a generic error that reveals neither the refused target nor anything
+    /// about issue or attachment existence.
+    fn same_origin_content_url(&self, content_url: &str) -> Result<reqwest::Url> {
+        // Deliberately generic and uniform with other download failures: the
+        // text must not disclose the target or issue/attachment existence.
+        const REFUSED: &str = "jira attachment download error";
+        let base = reqwest::Url::parse(&self.base_url).map_err(|_| anyhow!(REFUSED))?;
+        let candidate = if content_url.starts_with("http://") || content_url.starts_with("https://")
+        {
             content_url.to_string()
         } else {
             format!(
@@ -282,13 +308,11 @@ impl JiraClient {
                 }
             )
         };
-        let rb = self.apply_auth(self.http.get(&url), creds);
-        let resp = rb.send().await.map_err(sanitize)?;
-        let status = resp.status();
-        if !status.is_success() {
-            bail!("jira attachment download error (HTTP {})", status.as_u16());
+        let url = reqwest::Url::parse(&candidate).map_err(|_| anyhow!(REFUSED))?;
+        if url.origin() != base.origin() {
+            bail!(REFUSED);
         }
-        resp.bytes().await.map(|b| b.to_vec()).map_err(sanitize)
+        Ok(url)
     }
 
     /// GET transitions available for an issue.
@@ -578,6 +602,78 @@ mod tests {
     #[test]
     fn blank_user_agent_is_rejected() {
         assert!(JiraClient::new("https://example.atlassian.net", "  ").is_err());
+    }
+
+    fn https_client() -> JiraClient {
+        JiraClient::new("https://example.atlassian.net", "jirakeep/0.0.0 (+test)")
+            .expect("client builds")
+    }
+
+    #[test]
+    fn content_url_relative_resolves_against_base() {
+        let c = https_client();
+        let url = c
+            .same_origin_content_url("/secure/attachment/10001/notes.txt")
+            .expect("relative content URL resolves");
+        assert_eq!(
+            url.as_str(),
+            "https://example.atlassian.net/secure/attachment/10001/notes.txt"
+        );
+        let url = c
+            .same_origin_content_url("secure/attachment/10001/notes.txt")
+            .expect("relative content URL without leading slash resolves");
+        assert_eq!(
+            url.as_str(),
+            "https://example.atlassian.net/secure/attachment/10001/notes.txt"
+        );
+    }
+
+    #[test]
+    fn content_url_same_origin_absolute_is_allowed() {
+        let c = https_client();
+        let url = c
+            .same_origin_content_url("https://example.atlassian.net/secure/attachment/1/a.txt")
+            .expect("same-origin absolute content URL is allowed");
+        assert_eq!(url.host_str(), Some("example.atlassian.net"));
+    }
+
+    #[test]
+    fn content_url_default_port_matches_explicit_port() {
+        let c = JiraClient::new(
+            "https://example.atlassian.net:443",
+            "jirakeep/0.0.0 (+test)",
+        )
+        .expect("client builds");
+        assert!(c
+            .same_origin_content_url("https://example.atlassian.net/secure/attachment/1/a.txt")
+            .is_ok());
+    }
+
+    #[test]
+    fn content_url_foreign_host_is_refused_generically() {
+        let c = https_client();
+        let err = c
+            .same_origin_content_url("https://attacker.example/collect")
+            .expect_err("foreign host must be refused");
+        let msg = format!("{err:#}");
+        assert_eq!(msg, "jira attachment download error");
+        assert!(!msg.contains("attacker.example"), "target leaked: {msg}");
+    }
+
+    #[test]
+    fn content_url_http_downgrade_is_refused_when_base_is_https() {
+        let c = https_client();
+        assert!(c
+            .same_origin_content_url("http://example.atlassian.net/secure/attachment/1/a.txt")
+            .is_err());
+    }
+
+    #[test]
+    fn content_url_other_port_is_refused() {
+        let c = https_client();
+        assert!(c
+            .same_origin_content_url("https://example.atlassian.net:8443/secure/attachment/1/a.txt")
+            .is_err());
     }
 
     #[test]

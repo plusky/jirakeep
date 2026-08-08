@@ -83,7 +83,19 @@ Numbering aligns with bugwarden where the spirit matches; wording is Jira-specif
   to the client (I3 spirit; the embedded comment `total` tracks the served
   list).
 - **I7** Generic field-update tools must not smuggle security level, project
-  permission, or other privileged fields the capability model does not grant.
+  permission, or other privileged fields the capability model does not grant —
+  including any field whose mutation has its own capability: `assignee`
+  belongs to the `assign` gate; `resolution` belongs to the `status` gate
+  (Jira's edit endpoint sets any edit-screen field, and Resolution can sit on
+  the edit screen, so a bare `fields` grant could otherwise resolve or
+  mark-duplicate an issue); `parent` re-parents the issue (a hierarchy and
+  visibility change under I11/I14, not a plain field edit). So
+  `update_issue_fields` refuses all three even when `fields` is granted. The
+  banned set derives from an exhaustive match on `Capability`, and
+  `Capability::ALL` is generated from the same variant list as the enum
+  itself, so adding a capability forces a compile-time decision about the
+  fields it owns — one that no out-of-sync capability list can skip at
+  runtime.
 - **I8** Every tool that takes an issue key/id performs guard assessment
   BEFORE any side effect or data return. Exception: pure local URL builders
   that contact nothing.

@@ -71,4 +71,8 @@ tokio = { version = "1", features = [
     "process",
     "time",
 ] }
+# MCP integration tests through the library server (DESIGN.md testing bar):
+# an rmcp client on an in-process duplex transport, wiremock standing in
+# for Jira. Dev-only; the shipped binary gains no client-side code.
+rmcp = { version = "3.1", features = ["client"] }
 wiremock = "0.6"

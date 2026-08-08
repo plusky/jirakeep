@@ -70,7 +70,18 @@ Numbering aligns with bugwarden where the spirit matches; wording is Jira-specif
   policy `global.allow_restricted_comments = true` **and** the call opts in.
   Default policy has restricted content off.
 - **I6** Capability implication: `read` implies `summary`. Nothing else is
-  implied.
+  implied. The unprojected body `issue_info` serves for a `read` grant is
+  therefore stripped of capability-gated field families before it reaches
+  the client: `fields.attachment` (filenames, sizes, content URLs) requires
+  `attachments`; `fields.comment` requires `comments`, and even then
+  restricted-visibility comments are removed because `issue_info` has no
+  per-call restricted opt-in, so I5's dual opt-in is satisfiable only via
+  `issue_comments`; `fields.worklog` is always stripped — no v1 capability
+  covers worklog content, and ungoverned content is stripped, not served
+  (I4). Count-only `fields.watches` and `fields.votes` (counts, no
+  identities) are deliberately included in `read`. All removals are silent
+  to the client (I3 spirit; the embedded comment `total` tracks the served
+  list).
 - **I7** Generic field-update tools must not smuggle security level, project
   permission, or other privileged fields the capability model does not grant.
 - **I8** Every tool that takes an issue key/id performs guard assessment

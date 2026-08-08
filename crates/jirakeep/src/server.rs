@@ -457,6 +457,9 @@ impl JiraKeep {
                             .disclosable(&self.jira, &creds, &candidates, caller.as_deref())
                             .await;
                         let (scrubbed, removed) = Guard::scrub_links(&full, &disclosable);
+                        // Capability-gated field families (attachment,
+                        // comment, worklog) are not implied by Read (I6/I5).
+                        let scrubbed = Guard::scrub_gated_fields(access, scrubbed);
                         all_scrubbed.extend(removed);
                         if let Some(cell) = audit_cell(&ctx) {
                             cell.note_verdict_rule(
@@ -476,7 +479,7 @@ impl JiraKeep {
                                 },
                             );
                         }
-                        issues.push(proj);
+                        issues.push(Guard::scrub_gated_fields(access, proj));
                     } else {
                         restricted.push(key.clone());
                     }

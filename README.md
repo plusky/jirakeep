@@ -1,5 +1,8 @@
 # jirakeep
 
+<img src="https://raw.githubusercontent.com/plusky/jirakeep/main/assets/logo.svg"
+     align="right" width="130" alt="jirakeep logo">
+
 **jirakeep** is a Model Context Protocol (MCP) server, written in Rust, with
 operator-controlled security guards. It exposes an **Atlassian Jira Cloud**
 site to LLM clients while a policy file that the model can neither see nor

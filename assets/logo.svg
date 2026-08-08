@@ -1,0 +1,8 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 2048 2048" role="img" aria-label="jirakeep logo">
+<path fill="#FFFFFF" d="M 0 0 L 2048 0 L 2048 2048 L 0 2048 L 0 0 z"/>
+<path fill="#56656F" d="M 1024 300 L 1552 470 L 1552 1044 C 1552 1352 1330 1592 1024 1744 C 718 1592 496 1352 496 1044 L 496 470 Z"/>
+<path fill="#D89327" d="M 740 700 L 832 700 L 832 776 L 898 776 L 898 700 L 990 700 L 990 776 L 1056 776 L 1056 700 L 1148 700 L 1148 776 L 1214 776 L 1214 700 L 1306 700 L 1306 1450 L 740 1450 Z"/>
+<circle cx="1024" cy="1150" r="106" fill="#56656F"/>
+<path fill="#56656F" d="M 972 1230 L 1076 1230 L 1112 1450 L 936 1450 Z"/>
+</svg>

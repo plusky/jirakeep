@@ -33,12 +33,18 @@ pub struct Guard {
     pub policy: Policy,
 }
 
-/// Result of one search scan (client sees only `issues`).
+/// Result of one search scan (client sees only `issues` and
+/// `next_page_token`).
+///
+/// `scanned`, `dropped_keys`, and `scrubbed_keys` are server-side audit
+/// data and must never reach the MCP client (I3).
 #[derive(Debug, Clone, Default)]
 pub struct SearchWindow {
     pub issues: Vec<Value>,
     pub scanned: u32,
     pub dropped_keys: Vec<String>,
+    /// Linked issue keys removed from served issues by I14 scrubbing.
+    pub scrubbed_keys: Vec<String>,
     pub next_page_token: Option<String>,
 }
 
@@ -228,7 +234,13 @@ impl Guard {
         (visible, dropped)
     }
 
-    /// JQL search with silent post-filter (I3).
+    /// JQL search with silent post-filter (I3) and linked-key scrubbing (I14).
+    ///
+    /// Issue keys referenced from served issues (`issuelinks`, `parent`,
+    /// `subtasks`) that are not positively disclosable — policy-denied,
+    /// unfetchable, or past the [`Guard::MAX_ASSESS_KEYS`] assessment bound —
+    /// are removed from the served bodies and reported only via
+    /// [`SearchWindow::scrubbed_keys`] (fail closed, I4).
     #[allow(clippy::too_many_arguments)]
     pub async fn search_filtered(
         &self,
@@ -254,7 +266,40 @@ impl Guard {
             .unwrap_or_default();
         let scanned = raw.len() as u32;
         let (mut visible, dropped) = self.filter_issue_list(&raw, caller);
+        // Keys classified above as at least Summary-visible are disclosable
+        // in this window without spending assessment budget on a re-fetch.
+        let mut disclosable: BTreeSet<String> = visible
+            .iter()
+            .filter_map(|i| i.get("key").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
         visible.truncate(max_results as usize);
+
+        // I14: keys referenced from served issues (issuelinks, parent,
+        // subtasks) must themselves be disclosable; assess the unknown ones.
+        let mut candidates: BTreeSet<String> = BTreeSet::new();
+        for issue in &visible {
+            candidates.extend(Self::linked_keys(issue));
+        }
+        candidates.retain(|k| {
+            !disclosable.iter().any(|d| d.eq_ignore_ascii_case(k))
+                && !dropped.iter().any(|d| d.eq_ignore_ascii_case(k))
+        });
+        if !candidates.is_empty() {
+            // Bounded by MAX_ASSESS_KEYS inside `assess`; candidates past the
+            // bound or with failed fetches stay non-disclosable and scrub (I4).
+            let extra = self.disclosable(jira, creds, &candidates, caller).await;
+            disclosable.extend(extra);
+        }
+        let mut scrubbed_keys: Vec<String> = Vec::new();
+        for issue in &mut visible {
+            let (clean, removed) = Self::scrub_links(issue, &disclosable);
+            *issue = clean;
+            scrubbed_keys.extend(removed);
+        }
+        scrubbed_keys.sort();
+        scrubbed_keys.dedup();
+
         let next = envelope
             .get("nextPageToken")
             .and_then(Value::as_str)
@@ -263,6 +308,7 @@ impl Guard {
             issues: visible,
             scanned,
             dropped_keys: dropped,
+            scrubbed_keys,
             next_page_token: next,
         })
     }

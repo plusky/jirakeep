@@ -250,6 +250,144 @@ projects = ["SEC"]
 }
 
 #[tokio::test]
+async fn search_filtered_scrubs_denied_linked_keys() {
+    let server = MockServer::start().await;
+    // PUB-7 references denied and unavailable issues through its link fields.
+    let mut pub7 = issue("PUB-7", "PUB", None);
+    pub7["fields"]["issuelinks"] = json!([
+        {"outwardIssue": {"key": "SEC-42"}},
+        {"inwardIssue": {"key": "PUB-8"}},
+    ]);
+    pub7["fields"]["parent"] = json!({"key": "SEC-1"});
+    pub7["fields"]["subtasks"] = json!([{"key": "SEC-2"}, {"key": "PUB-9"}]);
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/search/jql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            // PUB-8 is in the served window: its key must stay disclosable
+            // without a classification re-fetch (no GET mock for PUB-8).
+            "issues": [pub7, issue("PUB-8", "PUB", None)],
+        })))
+        .mount(&server)
+        .await;
+    // Assessment fetches for linked keys outside the served window.
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/SEC-42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue("SEC-42", "SEC", None)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/SEC-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue("SEC-1", "SEC", None)))
+        .mount(&server)
+        .await;
+    // SEC-2 cannot be fetched at all: fail closed, scrub (I4).
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/SEC-2"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/PUB-9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue("PUB-9", "PUB", None)))
+        .mount(&server)
+        .await;
+
+    let g = guard(
+        r#"
+default_action = "allow"
+[[rule]]
+name = "hide"
+action = "deny"
+[rule.match]
+projects = ["SEC"]
+"#,
+    );
+    let window = g
+        .search_filtered(
+            &client(&server),
+            &creds(),
+            "project = PUB",
+            10,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(window.issues.len(), 2);
+    let served = &window.issues[0];
+    assert_eq!(served["key"], json!("PUB-7"));
+    let links = served["fields"]["issuelinks"].as_array().unwrap();
+    assert_eq!(links.len(), 1, "denied SEC-42 link must be scrubbed");
+    assert_eq!(links[0]["inwardIssue"]["key"], json!("PUB-8"));
+    assert!(
+        served["fields"].get("parent").is_none(),
+        "denied parent must be scrubbed"
+    );
+    let subs = served["fields"]["subtasks"].as_array().unwrap();
+    assert_eq!(subs.len(), 1, "unfetchable SEC-2 must scrub fail-closed");
+    assert_eq!(subs[0]["key"], json!("PUB-9"));
+    // Scrubbed keys stay on the audit side (I3); issues_search returns
+    // window.issues verbatim, so no served body may name a denied key.
+    assert_eq!(
+        window.scrubbed_keys,
+        vec!["SEC-1".to_string(), "SEC-2".into(), "SEC-42".into()]
+    );
+    let body = serde_json::to_string(&window.issues).unwrap();
+    assert!(!body.contains("SEC-"), "denied key leaked: {body}");
+}
+
+#[tokio::test]
+async fn search_filtered_scrubs_linked_keys_past_assess_bound() {
+    let server = MockServer::start().await;
+    let total = Guard::MAX_ASSESS_KEYS + 5;
+    let subtasks: Vec<serde_json::Value> = (1..=total)
+        .map(|i| json!({"key": format!("LNK-{i}")}))
+        .collect();
+    let mut parent = issue("PUB-1", "PUB", None);
+    parent["fields"]["subtasks"] = json!(subtasks);
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/search/jql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issues": [parent]})))
+        .mount(&server)
+        .await;
+    // Every linked key would classify as allowed if it were assessed.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/rest/api/3/issue/LNK-\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue("LNK-0", "LNK", None)))
+        .mount(&server)
+        .await;
+
+    let g = guard("default_action = \"allow\"\n");
+    let window = g
+        .search_filtered(
+            &client(&server),
+            &creds(),
+            "project = PUB",
+            10,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(window.issues.len(), 1);
+    let subs = window.issues[0]["fields"]["subtasks"].as_array().unwrap();
+    assert_eq!(
+        subs.len(),
+        Guard::MAX_ASSESS_KEYS,
+        "keys past the assessment bound must scrub, not pass (I4)"
+    );
+    assert_eq!(window.scrubbed_keys.len(), total - Guard::MAX_ASSESS_KEYS);
+    for key in &window.scrubbed_keys {
+        assert!(
+            !subs.iter().any(|s| s["key"] == json!(key.as_str())),
+            "scrubbed key {key} still served"
+        );
+    }
+}
+
+#[tokio::test]
 async fn denial_text_has_no_token() {
     let msg = Guard::denial("SEC-1");
     assert!(!msg.contains(TOKEN));

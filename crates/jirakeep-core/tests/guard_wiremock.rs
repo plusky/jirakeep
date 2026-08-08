@@ -82,6 +82,82 @@ projects = ["SEC*"]
 }
 
 #[tokio::test]
+async fn assess_never_aliases_requested_key_to_another_issue() {
+    // I8 aliasing case: the later-requested key's reported form ("ABC-9")
+    // sorts before the earlier fetched key ("ZED-1"). The requested key
+    // must bind to the issue fetched for it — never to whichever issue
+    // happens to sort last among the fetched bodies.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/ZED-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue("ZED-1", "OPEN", None)))
+        .mount(&server)
+        .await;
+    // Moved issue: requesting OLD-9 reports key ABC-9 in a denied project.
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/OLD-9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue("ABC-9", "SEC", None)))
+        .mount(&server)
+        .await;
+
+    let g = guard(
+        r#"
+default_action = "allow"
+[[rule]]
+name = "hide-sec"
+action = "deny"
+[rule.match]
+projects = ["SEC"]
+"#,
+    );
+    let out = g
+        .assess(
+            &client(&server),
+            &creds(),
+            &["ZED-1".into(), "OLD-9".into()],
+            None,
+        )
+        .await;
+    // OLD-9 is assessed as the issue fetched for it (ABC-9, project SEC):
+    // denied, and never carrying ZED-1's body.
+    assert!(matches!(out["OLD-9"].0, Access::Denied { .. }));
+    assert_eq!(out["OLD-9"].1["key"], json!("ABC-9"));
+    assert!(out["ZED-1"].0.allows(Capability::Read));
+    assert_eq!(out["ZED-1"].1["key"], json!("ZED-1"));
+}
+
+#[tokio::test]
+async fn assess_resolves_case_and_moved_key_redirects() {
+    let server = MockServer::start().await;
+    // Case-only difference: requested lowercase, reported uppercase.
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/abc-9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue("ABC-9", "OPEN", None)))
+        .mount(&server)
+        .await;
+    // Moved issue: the reported key shares nothing with the requested one.
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/OLD-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue("NEW-5", "OPEN", None)))
+        .mount(&server)
+        .await;
+
+    let g = guard("default_action = \"allow\"\n");
+    let out = g
+        .assess(
+            &client(&server),
+            &creds(),
+            &["abc-9".into(), "OLD-1".into()],
+            None,
+        )
+        .await;
+    assert!(out["abc-9"].0.allows(Capability::Read));
+    assert_eq!(out["abc-9"].1["key"], json!("ABC-9"));
+    assert!(out["OLD-1"].0.allows(Capability::Read));
+    assert_eq!(out["OLD-1"].1["key"], json!("NEW-5"));
+}
+
+#[tokio::test]
 async fn assess_fail_closed_on_missing_issue() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

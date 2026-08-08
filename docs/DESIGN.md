@@ -154,7 +154,7 @@ pages.
 default_action = "allow"   # or "deny"; not "restrict"
 
 [global]
-min_issue_age_days = 0
+min_issue_age_days = 0   # access-side quarantine only; never gates issue creation
 allow_restricted_comments = false
 read_only = false
 disabled_tools = []

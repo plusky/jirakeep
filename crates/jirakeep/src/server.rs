@@ -706,12 +706,17 @@ impl JiraKeep {
         let Some(meta) = meta else {
             return Ok(err_text(Guard::denial(&p.key)));
         };
-        let size = meta.get("size").and_then(Value::as_u64).unwrap_or(0);
+        // Unknown size fails closed under a non-zero cap (I4); the download
+        // below is additionally bounded by the real byte count.
+        let size = meta.get("size").and_then(Value::as_u64);
         if !self.guard.attachment_within_cap(size) {
             note_refused(&ctx);
-            return Ok(err_text(format!(
-                "attachment exceeds max_attachment_bytes ({size} bytes)"
-            )));
+            return Ok(err_text(match size {
+                Some(bytes) => format!("attachment exceeds max_attachment_bytes ({bytes} bytes)"),
+                None => "attachment size is missing or unreadable; refusing under \
+                     max_attachment_bytes"
+                    .to_string(),
+            }));
         }
         let content_url = match meta.get("content").and_then(Value::as_str) {
             Some(u) => u,
@@ -719,7 +724,7 @@ impl JiraKeep {
         };
         match self
             .jira
-            .download_attachment_bytes(&creds, content_url)
+            .download_attachment_bytes(&creds, content_url, self.guard.attachment_cap())
             .await
         {
             Ok(bytes) => {
@@ -1093,7 +1098,7 @@ impl JiraKeep {
                 return Ok(err_text("content_base64 is not valid base64"));
             }
         };
-        if !self.guard.attachment_within_cap(bytes.len() as u64) {
+        if !self.guard.attachment_within_cap(Some(bytes.len() as u64)) {
             note_refused(&ctx);
             return Ok(err_text("attachment exceeds max_attachment_bytes"));
         }

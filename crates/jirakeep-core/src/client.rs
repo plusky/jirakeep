@@ -270,19 +270,40 @@ impl JiraClient {
     /// URL's origin; any other target is refused with a generic error before
     /// any request is made, so the caller's credentials are only ever sent to
     /// the operator's configured Jira origin (I12 spirit: token custody).
+    ///
+    /// `max_bytes` bounds the transfer when `Some`: a response declaring a
+    /// larger `Content-Length` is refused before the body is read, and the
+    /// body is otherwise read in chunks and aborted with an error as soon
+    /// as it would exceed the bound, so memory stays capped even when the
+    /// server declares no length or understates it. `None` means unbounded.
     pub async fn download_attachment_bytes(
         &self,
         creds: &Credentials,
         content_url: &str,
+        max_bytes: Option<u64>,
     ) -> Result<Vec<u8>> {
         let url = self.same_origin_content_url(content_url)?;
         let rb = self.apply_auth(self.http.get(url), creds);
-        let resp = rb.send().await.map_err(sanitize)?;
+        let mut resp = rb.send().await.map_err(sanitize)?;
         let status = resp.status();
         if !status.is_success() {
             bail!("jira attachment download error (HTTP {})", status.as_u16());
         }
-        resp.bytes().await.map(|b| b.to_vec()).map_err(sanitize)
+        if let (Some(cap), Some(declared)) = (max_bytes, resp.content_length()) {
+            if declared > cap {
+                bail!("jira attachment exceeds the size cap ({declared} > {cap} bytes)");
+            }
+        }
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(sanitize)? {
+            if let Some(cap) = max_bytes {
+                if (body.len() as u64).saturating_add(chunk.len() as u64) > cap {
+                    bail!("jira attachment exceeds the size cap (> {cap} bytes)");
+                }
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 
     /// Resolve an attachment content URL and enforce that it stays on the

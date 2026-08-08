@@ -203,6 +203,66 @@ impl Guard {
         }
     }
 
+    /// Remove capability-gated field families from a served issue body (I6).
+    ///
+    /// The unprojected `fields: None` fetch returns Jira's default navigable
+    /// field set, which bundles field families that have their own
+    /// capability. [`Capability::Read`] implies none of them:
+    ///
+    /// - `fields.attachment` (filenames, sizes, content URLs) is removed
+    ///   unless `access` grants [`Capability::Attachments`];
+    /// - `fields.comment` is removed unless `access` grants
+    ///   [`Capability::Comments`]. When granted, restricted-visibility
+    ///   comments are still removed: this path carries no per-call
+    ///   restricted opt-in, so I5's dual opt-in can never be satisfied here;
+    /// - `fields.worklog` is always removed — no v1 capability covers
+    ///   worklog content, and ungoverned content is stripped, not served
+    ///   (I4);
+    /// - count-only `fields.watches` / `fields.votes` are kept (deliberate:
+    ///   counts, no identities, no restricted content).
+    ///
+    /// Denied or ungranted access strips (fail closed, I4), and every
+    /// removal is silent to the client (I3 spirit): the embedded comment
+    /// `total` tracks the served list so no count betrays a removal.
+    pub fn scrub_gated_fields(access: &Access, mut issue: Value) -> Value {
+        let Some(fields) = issue.get_mut("fields").and_then(Value::as_object_mut) else {
+            return issue;
+        };
+        if !access.allows(Capability::Attachments) {
+            fields.remove("attachment");
+        }
+        // No v1 capability grants worklog content; fail closed (I4).
+        fields.remove("worklog");
+        if !access.allows(Capability::Comments) {
+            fields.remove("comment");
+        } else if let Some(container) = fields.get_mut("comment") {
+            let served = container
+                .get_mut("comments")
+                .and_then(Value::as_array_mut)
+                .map(|list| {
+                    // I5: no opt-in is possible on this path, so restricted
+                    // comments are always removed here.
+                    list.retain(|c| !Self::comment_is_restricted(c));
+                    list.len()
+                });
+            match served {
+                Some(n) => {
+                    // Silent removal (I3): total matches the served list.
+                    if let Some(obj) = container.as_object_mut() {
+                        if obj.contains_key("total") {
+                            obj.insert("total".into(), json!(n));
+                        }
+                    }
+                }
+                // Unrecognized container shape: strip rather than serve (I4).
+                None => {
+                    fields.remove("comment");
+                }
+            }
+        }
+        issue
+    }
+
     /// Filter a list of issue objects; returns (visible, dropped_keys).
     /// Dropped keys must never reach the MCP client (I3).
     pub fn filter_issue_list(
@@ -660,6 +720,99 @@ projects = ["SEC"]
         assert_eq!(links.len(), 1);
         assert!(scrubbed["fields"].get("parent").is_none());
         assert_eq!(scrubbed["fields"]["subtasks"].as_array().unwrap().len(), 1);
+    }
+
+    fn gated_issue() -> Value {
+        json!({
+            "key": "HR-3",
+            "fields": {
+                "summary": "s",
+                "attachment": [{"filename": "severance-agreement-smith.pdf"}],
+                "comment": {
+                    "comments": [
+                        {"id": "1", "body": "public"},
+                        {"id": "2", "body": "secret",
+                         "visibility": {"type": "role", "value": "HR"}},
+                    ],
+                    "maxResults": 2,
+                    "total": 2,
+                    "startAt": 0,
+                },
+                "worklog": {"worklogs": [{"comment": "billing note"}], "total": 1},
+                "watches": {"watchCount": 3, "isWatching": false},
+                "votes": {"votes": 1, "hasVoted": false},
+            }
+        })
+    }
+
+    #[test]
+    fn scrub_gated_fields_read_only_strips_gated_families() {
+        let read_only = Access::Granted {
+            caps: BTreeSet::from([Capability::Read]),
+            rule: "r".into(),
+        };
+        let out = Guard::scrub_gated_fields(&read_only, gated_issue());
+        assert!(out["fields"].get("attachment").is_none());
+        assert!(out["fields"].get("comment").is_none());
+        assert!(out["fields"].get("worklog").is_none());
+        // Count-only families stay under Read (documented in I6).
+        assert_eq!(out["fields"]["watches"]["watchCount"], json!(3));
+        assert_eq!(out["fields"]["votes"]["votes"], json!(1));
+        assert_eq!(out["fields"]["summary"], json!("s"));
+    }
+
+    #[test]
+    fn scrub_gated_fields_comments_grant_filters_restricted() {
+        let with_comments = Access::Granted {
+            caps: BTreeSet::from([Capability::Read, Capability::Comments]),
+            rule: "r".into(),
+        };
+        let out = Guard::scrub_gated_fields(&with_comments, gated_issue());
+        let comments = out["fields"]["comment"]["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1, "restricted comment must be removed (I5)");
+        assert_eq!(comments[0]["id"], json!("1"));
+        // Silent removal (I3): total tracks the served list.
+        assert_eq!(out["fields"]["comment"]["total"], json!(1));
+        assert!(out["fields"].get("attachment").is_none());
+        assert!(out["fields"].get("worklog").is_none());
+    }
+
+    #[test]
+    fn scrub_gated_fields_attachments_grant_keeps_attachment() {
+        let with_attachments = Access::Granted {
+            caps: BTreeSet::from([Capability::Read, Capability::Attachments]),
+            rule: "r".into(),
+        };
+        let out = Guard::scrub_gated_fields(&with_attachments, gated_issue());
+        assert!(out["fields"].get("attachment").is_some());
+        assert!(out["fields"].get("comment").is_none());
+        assert!(out["fields"].get("worklog").is_none());
+    }
+
+    #[test]
+    fn scrub_gated_fields_denied_strips_everything_gated() {
+        let denied = Access::Denied { rule: "d".into() };
+        let out = Guard::scrub_gated_fields(&denied, gated_issue());
+        assert!(out["fields"].get("attachment").is_none());
+        assert!(out["fields"].get("comment").is_none());
+        assert!(out["fields"].get("worklog").is_none());
+    }
+
+    #[test]
+    fn scrub_gated_fields_malformed_comment_container_fails_closed() {
+        let with_comments = Access::Granted {
+            caps: BTreeSet::from([Capability::Read, Capability::Comments]),
+            rule: "r".into(),
+        };
+        let issue = json!({
+            "key": "HR-3",
+            "fields": {"summary": "s", "comment": {"comments": "not-an-array"}}
+        });
+        let out = Guard::scrub_gated_fields(&with_comments, issue);
+        assert!(
+            out["fields"].get("comment").is_none(),
+            "strip, never serve (I4)"
+        );
     }
 
     #[test]

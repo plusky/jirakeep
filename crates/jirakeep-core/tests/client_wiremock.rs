@@ -2,7 +2,7 @@
 
 use jirakeep_core::client::{AuthMode, Credentials, JiraClient};
 use serde_json::json;
-use wiremock::matchers::{header, method, path, path_regex};
+use wiremock::matchers::{any, header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TOKEN: &str = "SUPERSECRETTOKEN123";
@@ -136,6 +136,62 @@ async fn add_comment() {
     let c = basic_client(&server);
     let out = c.add_comment(&creds(), "PROJ-1", "hi", None).await.unwrap();
     assert_eq!(out["id"], json!("100"));
+}
+
+#[tokio::test]
+async fn download_attachment_relative_and_same_origin_urls() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/secure/attachment/10001/notes.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+        .mount(&server)
+        .await;
+
+    let c = basic_client(&server);
+    // A relative content URL resolves against the (here: http) base URL.
+    let bytes = c
+        .download_attachment_bytes(&creds(), "/secure/attachment/10001/notes.txt")
+        .await
+        .expect("relative download");
+    assert_eq!(bytes, b"hello");
+    // An absolute content URL on the same origin is honored too.
+    let absolute = format!("{}/secure/attachment/10001/notes.txt", server.uri());
+    let bytes = c
+        .download_attachment_bytes(&creds(), &absolute)
+        .await
+        .expect("same-origin absolute download");
+    assert_eq!(bytes, b"hello");
+}
+
+#[tokio::test]
+async fn download_attachment_never_contacts_a_foreign_host() {
+    let jira = MockServer::start().await;
+    let foreign = MockServer::start().await;
+    // Any request reaching the foreign host — credentialed or not — fails
+    // the test on drop via the expect(0) verification.
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"stolen".to_vec()))
+        .expect(0)
+        .mount(&foreign)
+        .await;
+
+    let c = basic_client(&jira);
+    let off_origin = format!("{}/collect", foreign.uri());
+    let err = c
+        .download_attachment_bytes(&creds(), &off_origin)
+        .await
+        .expect_err("off-origin content URL must be refused");
+    let msg = format!("{err:#}");
+    assert!(!msg.contains(TOKEN), "token leaked into error: {msg}");
+    assert!(
+        !msg.contains(&foreign.uri()),
+        "refusal echoed the foreign URL: {msg}"
+    );
+    let received = foreign.received_requests().await.unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "a request (and its Authorization header) reached the foreign host"
+    );
 }
 
 #[tokio::test]

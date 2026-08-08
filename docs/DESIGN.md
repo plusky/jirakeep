@@ -111,6 +111,17 @@ Jira has **no** Bugzilla-style multi-group list on the issue.
 **Fail-open hazard:** mapping “no security level” to “public / empty groups”
 would turn private projects into apparent public issues.
 
+**Security-level parsing is three-valued** (`SecurityLevel` in
+`jirakeep-core::policy`):
+
+- `security` absent or `null` ⇒ **absent**: knowledge that no level is set
+  (still not “public”); matches `has_security_level = false`.
+- an object with a string `name` ⇒ **present** with that level name.
+- any other shape (object without a readable `name`, non-object) ⇒
+  **unreadable**: unknown — independent of whether other metadata such as
+  the project was readable — so a consulted criterion denies (I4).
+  Unreadable never collapses into “no level”.
+
 **Rule for jirakeep:**
 
 1. Absent security level is **unknown** for any “publicness” criterion unless

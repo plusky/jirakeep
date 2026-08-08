@@ -178,6 +178,70 @@ async fn assess_fail_closed_on_missing_issue() {
     ));
 }
 
+/// I4: attachment metadata without a readable numeric `size` fails closed
+/// under a non-zero `max_attachment_bytes` — the content URL is never
+/// fetched. Mirrors the server's `download_attachment` flow: gate on the
+/// declared size first, download (cap-bounded) only after.
+#[tokio::test]
+async fn attachment_unknown_size_refused_before_download() {
+    let server = MockServer::start().await;
+    let content_path = "/rest/api/3/attachment/content/10001";
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/ATT-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "key": "ATT-1",
+            "id": "9",
+            "fields": {"attachment": [
+                {
+                    // No "size" key at all.
+                    "id": "10001",
+                    "filename": "big.bin",
+                    "content": format!("{}{content_path}", server.uri()),
+                },
+                {
+                    // Size present but not a u64 (string).
+                    "id": "10002",
+                    "filename": "big2.bin",
+                    "size": "524288000",
+                    "content": format!("{}{content_path}", server.uri()),
+                },
+            ]}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(content_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 8]))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let g = guard("default_action = \"allow\"\n[global]\nmax_attachment_bytes = 1024\n");
+    let jira = client(&server);
+    let atts = jira.list_attachments(&creds(), "ATT-1").await.unwrap();
+    assert_eq!(atts.len(), 2);
+    for meta in &atts {
+        let size = meta.get("size").and_then(serde_json::Value::as_u64);
+        if g.attachment_within_cap(size) {
+            // Pre-fix behavior: an unreadable size slipped through the cap
+            // and the body was fetched, tripping the expect(0) above.
+            let url = meta
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            let _ = jira
+                .download_attachment_bytes(&creds(), url, g.attachment_cap())
+                .await;
+        }
+        assert!(
+            !g.attachment_within_cap(size),
+            "unknown attachment size must fail closed (I4)"
+        );
+    }
+    // MockServer::verify (also run on drop) asserts no download happened.
+    server.verify().await;
+}
+
 #[tokio::test]
 async fn assess_security_level_deny() {
     let server = MockServer::start().await;

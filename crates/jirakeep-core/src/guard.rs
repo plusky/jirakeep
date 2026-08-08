@@ -332,9 +332,25 @@ impl Guard {
 
     /// Attachment privacy: Jira attachments do not always flag privacy the
     /// same way; treat missing as public metadata, but size-cap downloads.
-    pub fn attachment_within_cap(&self, size: u64) -> bool {
-        let cap = self.policy.global.max_attachment_bytes;
-        cap == 0 || size <= cap
+    ///
+    /// `size` is the byte count when it could be read from metadata, `None`
+    /// when it is missing or unreadable. With a non-zero cap an unknown size
+    /// is refused — unreadable metadata never yields more access than
+    /// readable metadata would (I4). A cap of `0` means no limit.
+    pub fn attachment_within_cap(&self, size: Option<u64>) -> bool {
+        match self.attachment_cap() {
+            None => true,
+            Some(cap) => size.is_some_and(|s| s <= cap),
+        }
+    }
+
+    /// The configured `max_attachment_bytes` bound, or `None` when the
+    /// policy value is `0` (documented as "no limit").
+    pub fn attachment_cap(&self) -> Option<u64> {
+        match self.policy.global.max_attachment_bytes {
+            0 => None,
+            cap => Some(cap),
+        }
     }
 
     /// Create-gate: classify a prospective issue's fields.
@@ -568,6 +584,28 @@ mod tests {
         let out = g.filter_comments(comments, true);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["id"], json!("1"));
+    }
+
+    #[test]
+    fn attachment_cap_fails_closed_on_unknown_size() {
+        let mut p = Policy::default();
+        p.global.max_attachment_bytes = 1024;
+        let g = Guard::new(p);
+        assert_eq!(g.attachment_cap(), Some(1024));
+        assert!(g.attachment_within_cap(Some(1024)));
+        assert!(!g.attachment_within_cap(Some(1025)));
+        // I4: a missing/unreadable size must not pass a non-zero cap.
+        assert!(!g.attachment_within_cap(None));
+    }
+
+    #[test]
+    fn attachment_cap_zero_means_unlimited() {
+        let mut p = Policy::default();
+        p.global.max_attachment_bytes = 0;
+        let g = Guard::new(p);
+        assert_eq!(g.attachment_cap(), None);
+        assert!(g.attachment_within_cap(Some(u64::MAX)));
+        assert!(g.attachment_within_cap(None));
     }
 
     #[test]

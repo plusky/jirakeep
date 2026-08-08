@@ -65,6 +65,82 @@ async fn get_issue() {
 }
 
 #[tokio::test]
+async fn download_attachment_within_cap_and_unbounded() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/attachments/content/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 512]))
+        .mount(&server)
+        .await;
+
+    let c = basic_client(&server);
+    // Exactly at the cap is allowed.
+    let bytes = c
+        .download_attachment_bytes(&creds(), "/attachments/content/1", Some(512))
+        .await
+        .unwrap();
+    assert_eq!(bytes.len(), 512);
+    // No cap (policy max_attachment_bytes = 0) stays unlimited.
+    let bytes = c
+        .download_attachment_bytes(&creds(), "/attachments/content/1", None)
+        .await
+        .unwrap();
+    assert_eq!(bytes.len(), 512);
+}
+
+#[tokio::test]
+async fn download_attachment_refuses_body_over_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/attachments/content/2"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 4096]))
+        .mount(&server)
+        .await;
+
+    // Even if attachment metadata understated the size, the real byte
+    // count is what the cap is enforced against.
+    let c = basic_client(&server);
+    let err = c
+        .download_attachment_bytes(&creds(), "/attachments/content/2", Some(1024))
+        .await
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("exceeds"), "unexpected error: {msg}");
+    assert!(!msg.contains(TOKEN), "token leaked into error: {msg}");
+}
+
+#[tokio::test]
+async fn download_attachment_aborts_stream_without_content_length() {
+    // wiremock always sets Content-Length, so use a raw socket to serve a
+    // chunked response with no declared length: the cap must still hold,
+    // enforced against the bytes actually received.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = std::io::Read::read(&mut sock, &mut buf);
+        let mut resp: Vec<u8> = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..8 {
+            resp.extend_from_slice(b"400\r\n");
+            resp.extend_from_slice(&[b'x'; 1024]);
+            resp.extend_from_slice(b"\r\n");
+        }
+        resp.extend_from_slice(b"0\r\n\r\n");
+        let _ = std::io::Write::write_all(&mut sock, &resp);
+    });
+
+    let c = JiraClient::new(&format!("http://{addr}"), UA).unwrap();
+    let err = c
+        .download_attachment_bytes(&creds(), "/attachments/content/3", Some(1024))
+        .await
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("exceeds"), "unexpected error: {msg}");
+    served.join().unwrap();
+}
+
+#[tokio::test]
 async fn search_jql() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -150,14 +226,14 @@ async fn download_attachment_relative_and_same_origin_urls() {
     let c = basic_client(&server);
     // A relative content URL resolves against the (here: http) base URL.
     let bytes = c
-        .download_attachment_bytes(&creds(), "/secure/attachment/10001/notes.txt")
+        .download_attachment_bytes(&creds(), "/secure/attachment/10001/notes.txt", None)
         .await
         .expect("relative download");
     assert_eq!(bytes, b"hello");
     // An absolute content URL on the same origin is honored too.
     let absolute = format!("{}/secure/attachment/10001/notes.txt", server.uri());
     let bytes = c
-        .download_attachment_bytes(&creds(), &absolute)
+        .download_attachment_bytes(&creds(), &absolute, None)
         .await
         .expect("same-origin absolute download");
     assert_eq!(bytes, b"hello");
@@ -178,7 +254,7 @@ async fn download_attachment_never_contacts_a_foreign_host() {
     let c = basic_client(&jira);
     let off_origin = format!("{}/collect", foreign.uri());
     let err = c
-        .download_attachment_bytes(&creds(), &off_origin)
+        .download_attachment_bytes(&creds(), &off_origin, None)
         .await
         .expect_err("off-origin content URL must be refused");
     let msg = format!("{err:#}");

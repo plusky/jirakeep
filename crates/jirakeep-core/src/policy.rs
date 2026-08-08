@@ -189,11 +189,36 @@ pub enum MatchOutcome {
     Unknown,
 }
 
+/// Parsed security-level state of an issue (DESIGN.md § visibility).
+///
+/// Jira issues carry at most one optional security level. Keeping "no
+/// level" distinct from "level present but unreadable" is what lets
+/// unreadable metadata deny instead of matching `has_security_level =
+/// false` — unreadable metadata must never yield more access than
+/// readable metadata would (invariant I4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SecurityLevel {
+    /// The issue has no security level (`security` absent or `null`).
+    ///
+    /// Knowledge of absence — NOT "public" (DESIGN.md § visibility). The
+    /// default: prospective issues built without Jira JSON (the create
+    /// gate) carry no level, since no tool may set one (I7).
+    #[default]
+    Absent,
+    /// The issue carries a security level with this name.
+    Present(String),
+    /// A `security` value was present but its shape could not be read
+    /// (object without a string `name`, or a non-object). Unknown:
+    /// consulted criteria cannot be decided, which denies (I4).
+    Unreadable,
+}
+
 /// Classification metadata extracted from a Jira issue (or create request).
 ///
-/// Every field is optional; `None` means UNKNOWN — never silently empty.
-/// Visibility: `security_level` None with project not in public_projects is
-/// **not** public (DESIGN.md § visibility).
+/// Every optional field uses `None` for UNKNOWN — never silently empty.
+/// `security_level` is three-valued ([`SecurityLevel`]): absence of a level
+/// with a project not in public_projects is **not** public, and an
+/// unreadable level is unknown, not absent (DESIGN.md § visibility).
 #[derive(Debug, Clone, Default)]
 pub struct IssueMeta {
     /// Issue key (`PROJ-123`), empty when unknown.
@@ -208,8 +233,9 @@ pub struct IssueMeta {
     pub status: Option<String>,
     pub priority: Option<String>,
     pub issue_type: Option<String>,
-    /// Security level name; `Some("")` is not used — absent level is `None`.
-    pub security_level: Option<String>,
+    /// Three-valued security-level state; unreadable shapes stay unknown
+    /// and deny when consulted (I4), never collapsing into "no level".
+    pub security_level: SecurityLevel,
     pub creation_time: Option<DateTime<Utc>>,
     /// Whether the requesting account reported the issue (`None` = unknown).
     pub created_by_me: Option<bool>,
@@ -273,15 +299,18 @@ impl IssueMeta {
             .and_then(|t| t.get("name"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        // Security level: null field => None (unknown / none). Present object
-        // with name => Some(name). Missing key entirely => None.
+        // Security level, three-valued (DESIGN.md § visibility): missing key
+        // or null => Absent (Jira omits/nulls the field when unset); object
+        // with a string name => Present(name); anything else — object
+        // without a readable name, or a non-object — => Unreadable, which
+        // is unknown and denies when consulted (I4).
         let security_level = match fields.get("security") {
-            None | Some(Value::Null) => None,
-            // Name when present; unreadable shapes stay None (unknown).
-            Some(v) => v.get("name").and_then(Value::as_str).map(str::to_owned),
+            None | Some(Value::Null) => SecurityLevel::Absent,
+            Some(v) => match v.get("name").and_then(Value::as_str) {
+                Some(name) => SecurityLevel::Present(name.to_owned()),
+                None => SecurityLevel::Unreadable,
+            },
         };
-        // If "security" key was present as a non-null non-object, we cannot
-        // read it — still None (unknown).
         let creation_time = fields
             .get("created")
             .and_then(Value::as_str)
@@ -356,7 +385,8 @@ pub struct Matcher {
     ///
     /// **Warning:** `has_security_level = false` is knowledge that no level
     /// is set — it is NOT "public". Combine with `project_public` for
-    /// visibility intent.
+    /// visibility intent. A `security` field whose shape cannot be read is
+    /// unknown (neither `true` nor `false`) and denies when consulted (I4).
     #[serde(default)]
     pub has_security_level: Option<bool>,
     #[serde(default)]
@@ -408,8 +438,11 @@ impl Matcher {
 
         if !self.security_levels.is_empty() {
             match &issue.security_level {
-                None => unknown = true,
-                Some(level) => {
+                // Fail closed: an absent level is deliberately unknown for a
+                // level-name criterion (DESIGN.md § visibility), and an
+                // unreadable one is unknown by definition (I4).
+                SecurityLevel::Absent | SecurityLevel::Unreadable => unknown = true,
+                SecurityLevel::Present(level) => {
                     if !any_glob(&self.security_levels, level) {
                         return MatchOutcome::No;
                     }
@@ -440,19 +473,23 @@ impl Matcher {
         }
 
         if let Some(want_level) = self.has_security_level {
-            // Presence of a security *level name* is known when we parsed the
-            // field: security_level Some means has level; None means no level
-            // OR unreadable. Distinguishing unreadable vs absent is hard from
-            // JSON alone when key is missing — treat None as "no level set"
-            // when project is known (Jira omits/nulls the field when unset).
-            // If project is also unknown, mark unknown.
-            if issue.project.is_none() && issue.security_level.is_none() {
-                unknown = true;
-            } else {
-                let has = issue.security_level.is_some();
-                if has != want_level {
-                    return MatchOutcome::No;
+            // Three-valued (DESIGN.md § visibility): Absent is knowledge
+            // that no level is set (Jira omits/nulls the field when unset);
+            // Present is knowledge of a level; Unreadable is unknown —
+            // independent of whether the project was readable — and denies
+            // when consulted (I4).
+            match &issue.security_level {
+                SecurityLevel::Absent => {
+                    if want_level {
+                        return MatchOutcome::No;
+                    }
                 }
+                SecurityLevel::Present(_) => {
+                    if !want_level {
+                        return MatchOutcome::No;
+                    }
+                }
+                SecurityLevel::Unreadable => unknown = true,
             }
         }
 
@@ -808,6 +845,100 @@ security_levels = ["*Embargo*"]
         assert!(!p
             .classify(&meta, Utc::now(), Operation::Access)
             .allows(Capability::Summary));
+    }
+
+    #[test]
+    fn unreadable_security_shape_is_unknown() {
+        let matcher = Matcher {
+            has_security_level: Some(false),
+            ..Default::default()
+        };
+        // Object without a readable name (e.g. permission-trimmed response).
+        let mut v = issue_json("X", None);
+        v["fields"]["security"] = json!({"id": "10001", "self": "https://j/securitylevel/10001"});
+        let meta = IssueMeta::from_jira_issue(&v, None, &[]);
+        assert_eq!(meta.security_level, SecurityLevel::Unreadable);
+        assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::Unknown);
+        // Non-object shape.
+        v["fields"]["security"] = json!("high");
+        let meta = IssueMeta::from_jira_issue(&v, None, &[]);
+        assert_eq!(meta.security_level, SecurityLevel::Unreadable);
+        assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::Unknown);
+        // Unknown in both polarities — never Yes/No.
+        let want_true = Matcher {
+            has_security_level: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(want_true.evaluate(&meta, Utc::now()), MatchOutcome::Unknown);
+    }
+
+    #[test]
+    fn absent_or_null_security_is_known_absent() {
+        let matcher = Matcher {
+            has_security_level: Some(false),
+            ..Default::default()
+        };
+        // Key missing entirely.
+        let mut v = issue_json("X", None);
+        v["fields"].as_object_mut().unwrap().remove("security");
+        let meta = IssueMeta::from_jira_issue(&v, None, &[]);
+        assert_eq!(meta.security_level, SecurityLevel::Absent);
+        assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::Yes);
+        // Explicit null.
+        let meta = IssueMeta::from_jira_issue(&issue_json("X", None), None, &[]);
+        assert_eq!(meta.security_level, SecurityLevel::Absent);
+        assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::Yes);
+        // A named level is known-present and fails `has_security_level = false`.
+        let meta = IssueMeta::from_jira_issue(&issue_json("X", Some("Embargo")), None, &[]);
+        assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::No);
+    }
+
+    #[test]
+    fn nameless_security_object_denies_open_issue_rule() {
+        // The DESIGN.md § visibility hazard: an allow rule meaning "issues
+        // with no security level are open" must NOT match an issue whose
+        // security level exists but could not be parsed (I4).
+        let p = Policy::from_toml_str(
+            r#"
+default_action = "deny"
+[[rule]]
+name = "open-issues-are-readable"
+action = "allow"
+[rule.match]
+has_security_level = false
+"#,
+        )
+        .unwrap();
+        let mut v = issue_json("X", None);
+        v["fields"]["security"] = json!({"id": "10001"});
+        let meta = IssueMeta::from_jira_issue(&v, None, &[]);
+        assert!(!p
+            .classify(&meta, Utc::now(), Operation::Access)
+            .allows(Capability::Summary));
+        // A genuinely level-free issue still matches the allow rule.
+        let meta2 = IssueMeta::from_jira_issue(&issue_json("X", None), None, &[]);
+        assert!(p
+            .classify(&meta2, Utc::now(), Operation::Access)
+            .allows(Capability::Read));
+    }
+
+    #[test]
+    fn has_security_level_decoupled_from_project() {
+        let matcher = Matcher {
+            has_security_level: Some(false),
+            ..Default::default()
+        };
+        // Absence is knowledge of absence even when the project is unknown.
+        let v = json!({"key": "X-1", "fields": {"summary": "t"}});
+        let meta = IssueMeta::from_jira_issue(&v, None, &[]);
+        assert!(meta.project.is_none());
+        assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::Yes);
+        // An unreadable level stays unknown even when the project IS known.
+        let mut v2 = issue_json("X", None);
+        v2["fields"]["security"] = json!(7);
+        let meta2 = IssueMeta::from_jira_issue(&v2, None, &[]);
+        assert!(meta2.project.is_some());
+        assert_eq!(matcher.evaluate(&meta2, Utc::now()), MatchOutcome::Unknown);
     }
 
     #[test]

@@ -70,6 +70,11 @@ impl Guard {
     }
 
     /// Classify issue keys against the policy (one fetch per distinct key).
+    ///
+    /// A key the server reports under a different form (case change or a
+    /// moved-issue redirect) is bound to the issue fetched for that key,
+    /// never to any other fetched issue (I8); a key that cannot be bound
+    /// to a fetched body is denied (I4).
     pub async fn assess(
         &self,
         jira: &JiraClient,
@@ -106,13 +111,14 @@ impl Guard {
                         .and_then(Value::as_str)
                         .unwrap_or(key)
                         .to_owned();
-                    fetched.insert(reported, issue);
-                    // Also index under requested key if different (case).
-                    if !fetched.contains_key(key) {
-                        if let Some(v) = fetched.values().last().cloned() {
-                            fetched.insert(key.to_owned(), v);
-                        }
+                    // Also index under the requested key when the server
+                    // reported a different one (case change or moved-issue
+                    // redirect), binding it to the issue just fetched —
+                    // never to another entry in the map (I8/I4).
+                    if reported != key && !fetched.contains_key(key) {
+                        fetched.insert(key.to_owned(), issue.clone());
                     }
+                    fetched.insert(reported, issue);
                 }
                 Err(err) => {
                     tracing::debug!(key, error = %err, "classification fetch failed");

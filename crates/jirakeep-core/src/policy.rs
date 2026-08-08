@@ -554,6 +554,10 @@ impl Rule {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Global {
+    /// Deny **access** to issues younger than this many days (0 = off).
+    ///
+    /// Access-side quarantine only: it never gates [`Operation::Create`],
+    /// and an unreadable `created` field fails closed (I4).
     pub min_issue_age_days: i64,
     pub allow_restricted_comments: bool,
     pub read_only: bool,
@@ -680,8 +684,19 @@ impl Policy {
     }
 
     /// Classify one issue into an [`Access`] decision.
+    ///
+    /// The `global.min_issue_age_days` quarantine applies only to
+    /// [`Operation::Access`]: it hides freshly filed issues and fails closed
+    /// when `created` is unreadable (I4). [`Operation::Create`] classifies a
+    /// prospective issue that has no creation time by definition, so the age
+    /// gate never consults it; restricting creation is done through rules
+    /// scoped with `operations = ["create"]`.
     pub fn classify(&self, issue: &IssueMeta, now: DateTime<Utc>, op: Operation) -> Access {
-        if self.global.min_issue_age_days > 0 {
+        let age_gated = match op {
+            Operation::Access => self.global.min_issue_age_days > 0,
+            Operation::Create => false,
+        };
+        if age_gated {
             let too_young = match (
                 issue.creation_time,
                 age_cutoff(now, self.global.min_issue_age_days),
@@ -959,6 +974,74 @@ created_by_me = false
         assert!(!p
             .classify(&meta, Utc::now(), Operation::Access)
             .allows(Capability::Read));
+    }
+
+    #[test]
+    fn min_issue_age_denies_young_and_unreadable_access() {
+        let p = Policy::from_toml_str(
+            r#"
+default_action = "allow"
+[global]
+min_issue_age_days = 7
+"#,
+        )
+        .unwrap();
+        let now = Utc::now();
+        // Issue younger than the threshold: quarantined on access.
+        let mut young = IssueMeta::from_jira_issue(&issue_json("OPEN", None), None, &[]);
+        young.creation_time = Some(now - Duration::days(1));
+        assert!(!p
+            .classify(&young, now, Operation::Access)
+            .allows(Capability::Summary));
+        // Unreadable `created` fails closed on access (I4).
+        let mut unreadable = IssueMeta::from_jira_issue(&issue_json("OPEN", None), None, &[]);
+        unreadable.creation_time = None;
+        assert!(!p
+            .classify(&unreadable, now, Operation::Access)
+            .allows(Capability::Summary));
+        // An issue older than the threshold reads normally.
+        let mut old = IssueMeta::from_jira_issue(&issue_json("OPEN", None), None, &[]);
+        old.creation_time = Some(now - Duration::days(30));
+        assert!(p
+            .classify(&old, now, Operation::Access)
+            .allows(Capability::Read));
+    }
+
+    #[test]
+    fn min_issue_age_does_not_gate_create() {
+        let p = Policy::from_toml_str(
+            r#"
+default_action = "allow"
+[global]
+min_issue_age_days = 7
+"#,
+        )
+        .unwrap();
+        // Prospective issue: no creation time by definition.
+        let prospective = IssueMeta {
+            project: Some("OPEN".to_owned()),
+            created_by_me: Some(true),
+            ..IssueMeta::default()
+        };
+        assert!(p
+            .classify(&prospective, Utc::now(), Operation::Create)
+            .allows(Capability::Create));
+        // Rules scoped to create still gate creation as before.
+        let p2 = Policy::from_toml_str(
+            r#"
+default_action = "allow"
+[global]
+min_issue_age_days = 7
+[[rule]]
+name = "no-filing"
+action = "deny"
+operations = ["create"]
+"#,
+        )
+        .unwrap();
+        assert!(!p2
+            .classify(&prospective, Utc::now(), Operation::Create)
+            .allows(Capability::Create));
     }
 
     #[test]

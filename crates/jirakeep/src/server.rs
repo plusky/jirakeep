@@ -92,6 +92,68 @@ fn note_refused(ctx: &RequestContext<RoleServer>) {
     }
 }
 
+/// Privileged Jira `fields` keys no capability grants through any tool (I7).
+const PRIVILEGED_FIELDS: &[&str] = &["security", "project", "reporter"];
+
+/// Jira `fields` keys whose mutation is owned by `cap`'s dedicated gate
+/// rather than the generic `fields` gate.
+///
+/// `update_issue_fields` (gated on [`Capability::Fields`]) refuses every key
+/// returned here (I7): granting `fields` must never exercise a capability the
+/// operator withheld. `assignee` belongs to `assign_issue`
+/// ([`Capability::Assign`]); `resolution` belongs to the status gate
+/// ([`Capability::Status`], "transition status / resolve / mark duplicate"),
+/// because Jira's edit endpoint sets any edit-screen field and Resolution can
+/// be placed on the edit screen; `parent` re-parents the issue — a hierarchy
+/// and visibility change owned by the linking gate ([`Capability::Links`],
+/// I11/I14), not a plain field edit.
+///
+/// The match is deliberately exhaustive, and [`Capability::ALL`] (which
+/// [`refused_field`] iterates) is generated from the same variant list as
+/// the enum: adding a [`Capability`] variant fails compilation here, forcing
+/// a decision about which fields it owns, and that decision cannot be
+/// skipped at runtime by an out-of-date `ALL`.
+fn capability_owned_fields(cap: Capability) -> &'static [&'static str] {
+    match cap {
+        // Read-side capabilities set nothing.
+        Capability::Read
+        | Capability::Summary
+        | Capability::Comments
+        | Capability::History
+        | Capability::Attachments => &[],
+        // These writes go through dedicated endpoints or request sections,
+        // never the edit endpoint's `fields` object.
+        Capability::Comment | Capability::Watchers | Capability::Create | Capability::Attach => &[],
+        // The generic field gate itself reserves no keys.
+        Capability::Fields => &[],
+        // Transitions use the transitions endpoint, but `resolution` is an
+        // ordinary edit-screen field on instances that expose it, so a bare
+        // `fields` grant could otherwise resolve or mark-duplicate an issue.
+        Capability::Status => &["resolution"],
+        Capability::Assign => &["assignee"],
+        Capability::Links => &["parent"],
+    }
+}
+
+/// First key in `fields` that `update_issue_fields` must refuse (I7): a
+/// privileged field no capability grants, or a field owned by a dedicated
+/// capability's own gate.
+fn refused_field(fields: &serde_json::Map<String, Value>) -> Option<&'static str> {
+    for banned in PRIVILEGED_FIELDS.iter().copied() {
+        if fields.contains_key(banned) {
+            return Some(banned);
+        }
+    }
+    for cap in Capability::ALL {
+        for owned in capability_owned_fields(cap).iter().copied() {
+            if fields.contains_key(owned) {
+                return Some(owned);
+            }
+        }
+    }
+    None
+}
+
 // --- params -----------------------------------------------------------------
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -162,7 +224,9 @@ pub struct AssignParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UpdateFieldsParams {
     pub key: String,
-    /// Fields object (Jira REST shape). Security level changes are rejected.
+    /// Fields object (Jira REST shape). Privileged fields (security, project,
+    /// reporter) and fields owned by a dedicated capability (assignee,
+    /// parent) are rejected.
     pub fields: Value,
 }
 
@@ -906,7 +970,7 @@ impl JiraKeep {
     }
 
     #[tool(
-        description = "Update issue fields (Jira fields object). Rejects security level and project smuggling.",
+        description = "Update issue fields (Jira fields object). Rejects privileged fields (security, project, reporter) and fields owned by a dedicated capability: assignee (use assign_issue), resolution (use transition_issue), and parent.",
         annotations(read_only_hint = false, open_world_hint = true)
     )]
     async fn update_issue_fields(
@@ -922,15 +986,13 @@ impl JiraKeep {
         {
             return Ok(deny);
         }
-        // I7: block privileged field smuggling.
+        // I7: block privileged field smuggling and capability bypass.
         if let Some(obj) = p.fields.as_object() {
-            for banned in ["security", "project", "reporter"] {
-                if obj.contains_key(banned) {
-                    note_refused(&ctx);
-                    return Ok(err_text(format!(
-                        "field \"{banned}\" cannot be set through update_issue_fields"
-                    )));
-                }
+            if let Some(banned) = refused_field(obj) {
+                note_refused(&ctx);
+                return Ok(err_text(format!(
+                    "field \"{banned}\" cannot be set through update_issue_fields"
+                )));
             }
         } else {
             note_refused(&ctx);
@@ -1270,6 +1332,56 @@ mod tests {
                 names.iter().any(|n| n == need),
                 "missing {need} in {names:?}"
             );
+        }
+    }
+
+    #[test]
+    fn update_fields_refuses_capability_owned_keys() {
+        // I7: `assignee` is owned by Capability::Assign (assign_issue),
+        // `resolution` by Capability::Status (Jira's edit endpoint sets any
+        // edit-screen field, so this would resolve/mark-duplicate), and
+        // `parent` by the linking gate — a `fields` grant alone must never
+        // exercise any of them.
+        let fields = json!({"assignee": {"accountId": "5b10a"}});
+        assert_eq!(refused_field(fields.as_object().unwrap()), Some("assignee"));
+        let fields = json!({"resolution": {"name": "Done"}});
+        assert_eq!(
+            refused_field(fields.as_object().unwrap()),
+            Some("resolution")
+        );
+        let fields = json!({"summary": "s", "parent": {"key": "OPS-1"}});
+        assert_eq!(refused_field(fields.as_object().unwrap()), Some("parent"));
+    }
+
+    #[test]
+    fn update_fields_still_refuses_privileged_fields() {
+        for banned in ["security", "project", "reporter"] {
+            let mut obj = serde_json::Map::new();
+            obj.insert(banned.to_owned(), json!({"id": "1"}));
+            assert_eq!(refused_field(&obj), Some(banned));
+        }
+    }
+
+    #[test]
+    fn update_fields_permits_ordinary_edits() {
+        let fields = json!({
+            "summary": "new summary",
+            "labels": ["triage"],
+            "priority": {"name": "High"},
+        });
+        assert_eq!(refused_field(fields.as_object().unwrap()), None);
+    }
+
+    #[test]
+    fn every_capability_owned_field_is_refused() {
+        // Structural pin: any field a capability owns must be refused by the
+        // generic fields gate, so a future capability cannot reopen I7.
+        for cap in Capability::ALL {
+            for owned in capability_owned_fields(cap).iter().copied() {
+                let mut obj = serde_json::Map::new();
+                obj.insert(owned.to_owned(), json!("x"));
+                assert_eq!(refused_field(&obj), Some(owned), "capability {cap:?}");
+            }
         }
     }
 

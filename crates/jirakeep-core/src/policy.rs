@@ -16,15 +16,40 @@ use anyhow::{bail, Context as _};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 
-/// A capability a policy grant can carry.
-///
-/// The only implication is `read` ⇒ `summary` (invariant I6), applied in
-/// [`Access::allows`] — never stored in the set itself.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Capability {
+/// Declares [`Capability`] and [`Capability::ALL`] from a single variant
+/// list, so `ALL` structurally cannot omit a variant: adding a capability
+/// here extends the enum and `ALL` in the same edit, and every exhaustive
+/// `match` on [`Capability`] elsewhere (e.g. the I7 capability-owned-fields
+/// map in the server) fails to compile until it is revisited. A variant
+/// that existed but was missing from `ALL` would be grantable by `restrict`
+/// rules yet silently skipped by every `ALL`-driven check — this macro makes
+/// that state unrepresentable.
+macro_rules! capabilities {
+    ($($(#[$meta:meta])* $variant:ident,)+) => {
+        /// A capability a policy grant can carry.
+        ///
+        /// The only implication is `read` ⇒ `summary` (invariant I6), applied in
+        /// [`Access::allows`] — never stored in the set itself.
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+        )]
+        #[serde(rename_all = "snake_case")]
+        pub enum Capability {
+            $($(#[$meta])* $variant,)+
+        }
+
+        impl Capability {
+            /// Every capability, in declaration order. Used to expand `allow`
+            /// grants and to enumerate capability-owned fields (I7).
+            /// Generated from the same variant list as the enum itself, so it
+            /// can never fall out of sync with the variant set.
+            pub const ALL: [Capability; [$(Capability::$variant),+].len()] =
+                [$(Capability::$variant),+];
+        }
+    };
+}
+
+capabilities! {
     /// Full issue details (implies [`Capability::Summary`], I6).
     Read,
     /// Redacted summary-only view of an issue.
@@ -54,23 +79,6 @@ pub enum Capability {
 }
 
 impl Capability {
-    /// Every capability, in declaration order. Used to expand `allow` grants.
-    pub const ALL: [Capability; 13] = [
-        Capability::Read,
-        Capability::Summary,
-        Capability::Comments,
-        Capability::History,
-        Capability::Attachments,
-        Capability::Comment,
-        Capability::Status,
-        Capability::Fields,
-        Capability::Assign,
-        Capability::Watchers,
-        Capability::Links,
-        Capability::Create,
-        Capability::Attach,
-    ];
-
     /// Whether this capability permits mutating Jira state.
     pub fn is_write(self) -> bool {
         matches!(

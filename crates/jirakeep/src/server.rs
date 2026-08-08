@@ -625,6 +625,11 @@ impl JiraKeep {
                     cell.note_verdict(Verdict::Filtered);
                     cell.note_suppressed(window.dropped_keys.clone());
                     cell.note_suppressed_count(window.dropped_keys.len() as u64);
+                    // I14: linked keys scrubbed from served issues are
+                    // audit-side only, never client-visible.
+                    if !window.scrubbed_keys.is_empty() {
+                        cell.note_suppressed(window.scrubbed_keys.clone());
+                    }
                     cell.note_scan(u64::from(window.scanned), window.dropped_keys.len() as u64);
                 }
                 // I3: do not return scanned/dropped counts to the client.

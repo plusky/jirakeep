@@ -14,7 +14,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, RoleServer, ServiceExt as _};
 use serde_json::{json, Value};
-use wiremock::matchers::{body_partial_json, method, path, path_regex};
+use wiremock::matchers::{body_json, body_partial_json, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const KEY: &str = "DC-1";
@@ -183,4 +183,51 @@ async fn bearer_mode_works_end_to_end_on_rest_api_2_only() {
     let _ = client.cancel().await;
     let _ = server.cancel().await;
     // MockServer::drop verifies zero /rest/api/3 hits and one v2 search.
+}
+
+/// #15: on v2 the created issue's `description` is the plain string, not an
+/// ADF doc — the exact body match leaves an ADF payload with no mock.
+#[tokio::test]
+async fn create_issue_description_is_plain_string_on_v2() {
+    let mock = MockServer::start().await;
+    Mock::given(path_regex(r"^/rest/api/3/.*"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/rest/api/2/issue"))
+        .and(body_json(json!({
+            "fields": {
+                "project": {"key": "DC"},
+                "summary": "dc summary",
+                "issuetype": {"name": "Task"},
+                "description": "plain body",
+            }
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "10002",
+            "key": "DC-2",
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let (client, server) = connect(&mock).await;
+    let created = call(
+        &client,
+        "create_issue",
+        json!({
+            "project_key": "DC",
+            "summary": "dc summary",
+            "issue_type": "Task",
+            "description": "plain body",
+        }),
+    )
+    .await;
+    assert_ne!(created.is_error, Some(true), "{created:?}");
+    assert_eq!(result_json(&created)["key"], json!("DC-2"));
+
+    let _ = client.cancel().await;
+    let _ = server.cancel().await;
 }

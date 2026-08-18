@@ -197,56 +197,95 @@ async fn search_falls_back_to_legacy_on_404() {
     assert_eq!(out["issues"][0]["key"], json!("LEG-1"));
 }
 
-#[tokio::test]
-async fn favourite_filters_accepts_bare_array() {
-    // Data Center serves /filter/favourite as a bare JSON array.
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/rest/api/3/filter/favourite"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {"id": "10042", "name": "triage", "jql": "project = OPS"},
-        ])))
-        .mount(&server)
-        .await;
-
-    let c = basic_client(&server);
-    let filters = c.favourite_filters(&creds()).await.unwrap();
-    assert_eq!(filters.len(), 1);
-    assert_eq!(filters[0]["id"], json!("10042"));
+/// v3 comment wire shape: an ADF doc.
+fn adf(text: &str) -> serde_json::Value {
+    json!({
+        "type": "doc",
+        "version": 1,
+        "content": [{
+            "type": "paragraph",
+            "content": [{"type": "text", "text": text}],
+        }],
+    })
 }
 
 #[tokio::test]
-async fn favourite_filters_accepts_object_shape() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/rest/api/3/filter/favourite"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "values": [{"id": "10042", "name": "triage", "jql": "project = OPS"}],
-        })))
-        .mount(&server)
-        .await;
-
-    let c = basic_client(&server);
-    let filters = c.favourite_filters(&creds()).await.unwrap();
-    assert_eq!(filters.len(), 1);
-    assert_eq!(filters[0]["name"], json!("triage"));
-}
-
-#[tokio::test]
-async fn add_comment() {
+async fn add_comment_v3_sends_adf_body() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/rest/api/3/issue/PROJ-1/comment"))
+        .and(body_json(json!({"body": adf("hi")})))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "id": "100",
             "body": {"type": "doc"},
         })))
+        .expect(1)
         .mount(&server)
         .await;
 
     let c = basic_client(&server);
     let out = c.add_comment(&creds(), "PROJ-1", "hi", None).await.unwrap();
     assert_eq!(out["id"], json!("100"));
+}
+
+#[tokio::test]
+async fn add_comment_v2_sends_plain_string_body() {
+    let server = MockServer::start().await;
+    // v2 (DC) comment bodies are plain strings; an ADF object 404s the test.
+    Mock::given(method("POST"))
+        .and(path("/rest/api/2/issue/DC-1/comment"))
+        .and(body_json(json!({"body": "hi"})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "200",
+            "body": "hi",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = bearer_client(&server);
+    let out = c.add_comment(&creds(), "DC-1", "hi", None).await.unwrap();
+    assert_eq!(out["id"], json!("200"));
+}
+
+#[tokio::test]
+async fn transition_comment_v3_sends_adf_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/issue/PROJ-1/transitions"))
+        .and(body_json(json!({
+            "transition": {"id": "31"},
+            "update": {"comment": [{"add": {"body": adf("done")}}]},
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = basic_client(&server);
+    c.transition_issue(&creds(), "PROJ-1", "31", None, Some("done"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn transition_comment_v2_sends_plain_string_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/api/2/issue/DC-1/transitions"))
+        .and(body_json(json!({
+            "transition": {"id": "31"},
+            "update": {"comment": [{"add": {"body": "done"}}]},
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = bearer_client(&server);
+    c.transition_issue(&creds(), "DC-1", "31", None, Some("done"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -404,4 +443,39 @@ async fn server_info_embeds_base_url() {
     let info = c.server_info(&creds()).await.unwrap();
     assert_eq!(info["url"], json!(server.uri()));
     assert_eq!(info["version"], json!("9.0.0"));
+}
+
+#[tokio::test]
+async fn favourite_filters_accepts_bare_array() {
+    // Data Center serves /filter/favourite as a bare JSON array.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/filter/favourite"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": "10042", "name": "triage", "jql": "project = OPS"},
+        ])))
+        .mount(&server)
+        .await;
+
+    let c = basic_client(&server);
+    let filters = c.favourite_filters(&creds()).await.unwrap();
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0]["id"], json!("10042"));
+}
+
+#[tokio::test]
+async fn favourite_filters_accepts_object_shape() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/filter/favourite"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "values": [{"id": "10042", "name": "triage", "jql": "project = OPS"}],
+        })))
+        .mount(&server)
+        .await;
+
+    let c = basic_client(&server);
+    let filters = c.favourite_filters(&creds()).await.unwrap();
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0]["name"], json!("triage"));
 }

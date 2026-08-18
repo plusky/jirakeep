@@ -16,7 +16,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, RoleServer, ServiceExt as _};
 use serde_json::{json, Value};
-use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::matchers::{body_json, body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const KEY: &str = "OPS-1";
@@ -350,5 +350,53 @@ async fn list_filters_never_serves_sharing_metadata() {
     assert_eq!(body["filters"][0]["id"], json!("10042"));
     assert_eq!(body["filters"][0]["owner"], json!("Alice"));
     assert_eq!(body["filters"][0]["jql"], json!("project = OPS"));
+    shutdown(client, server).await;
+}
+
+/// #15: on v3 the created issue's `description` stays an ADF doc — the
+/// exact body match leaves a plain-string payload with no mock.
+#[tokio::test]
+async fn create_issue_description_is_adf_on_v3() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/issue"))
+        .and(body_json(json!({
+            "fields": {
+                "project": {"key": "OPS"},
+                "summary": "s",
+                "issuetype": {"name": "Task"},
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "body"}],
+                    }],
+                },
+            }
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "10002",
+            "key": "OPS-2",
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let (client, server) = connect(&mock).await;
+    let args = json!({
+        "project_key": "OPS",
+        "summary": "s",
+        "issue_type": "Task",
+        "description": "body",
+    });
+    let args = args.as_object().cloned().expect("arguments object");
+    let created = client
+        .call_tool(CallToolRequestParams::new("create_issue").with_arguments(args))
+        .await
+        .expect("tools/call create_issue");
+    assert_ne!(created.is_error, Some(true), "{created:?}");
+    let body: Value = serde_json::from_str(result_text(&created)).expect("json body");
+    assert_eq!(body["key"], json!("OPS-2"));
     shutdown(client, server).await;
 }

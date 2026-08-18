@@ -2,7 +2,7 @@
 
 use jirakeep_core::client::{AuthMode, Credentials, JiraClient};
 use serde_json::json;
-use wiremock::matchers::{any, header, method, path, path_regex};
+use wiremock::matchers::{any, body_json, header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TOKEN: &str = "SUPERSECRETTOKEN123";
@@ -273,8 +273,9 @@ async fn download_attachment_never_contacts_a_foreign_host() {
 #[tokio::test]
 async fn bearer_auth_sends_authorization_header() {
     let server = MockServer::start().await;
+    // Bearer defaults to the DC surface: /rest/api/2.
     Mock::given(method("GET"))
-        .and(path("/rest/api/3/myself"))
+        .and(path("/rest/api/2/myself"))
         .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "accountId": "dc-user",
@@ -292,6 +293,46 @@ async fn bearer_auth_sends_authorization_header() {
         .await
         .unwrap();
     assert_eq!(me["accountId"], json!("dc-user"));
+}
+
+#[tokio::test]
+async fn search_v2_uses_offset_paging_and_ignores_page_token() {
+    let server = MockServer::start().await;
+    // Exact-body match: startAt is sent, nextPageToken never enters the
+    // payload even when a caller supplies one, and no /search/jql call is
+    // made (any other request 404s the test).
+    Mock::given(method("POST"))
+        .and(path("/rest/api/2/search"))
+        .and(body_json(json!({
+            "jql": "project = DC",
+            "maxResults": 10,
+            "fields": ["summary"],
+            "startAt": 5,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issues": [{"key": "DC-6", "fields": {"summary": "s"}}],
+            "startAt": 5,
+            "maxResults": 10,
+            "total": 42,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = bearer_client(&server);
+    let out = c
+        .search(
+            &creds(),
+            "project = DC",
+            &["summary"],
+            10,
+            Some("stale-token"),
+            Some(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out["issues"][0]["key"], json!("DC-6"));
+    assert!(out.get("nextPageToken").is_none());
 }
 
 #[tokio::test]

@@ -36,6 +36,26 @@ impl From<AuthModeCli> for jirakeep_core::client::AuthMode {
     }
 }
 
+/// Jira REST API version to target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ApiVersionCli {
+    /// `/rest/api/2` — Jira Data Center.
+    #[value(name = "2")]
+    V2,
+    /// `/rest/api/3` — Jira Cloud.
+    #[value(name = "3")]
+    V3,
+}
+
+impl From<ApiVersionCli> for jirakeep_core::client::ApiVersion {
+    fn from(value: ApiVersionCli) -> Self {
+        match value {
+            ApiVersionCli::V2 => jirakeep_core::client::ApiVersion::V2,
+            ApiVersionCli::V3 => jirakeep_core::client::ApiVersion::V3,
+        }
+    }
+}
+
 /// MCP server for Atlassian Jira with operator-controlled security guards.
 #[derive(Parser)]
 #[command(name = "jirakeep", version, about)]
@@ -47,6 +67,11 @@ pub struct Cli {
     /// Authentication mode: 'basic' (Cloud email+token, default) or 'bearer' (DC PAT).
     #[arg(long, env = "JIRA_AUTH_MODE", value_enum, default_value = "basic")]
     pub auth_mode: AuthModeCli,
+
+    /// Jira REST API version: '2' (Data Center) or '3' (Cloud). Defaults by
+    /// auth mode: basic -> 3, bearer -> 2.
+    #[arg(long, env = "JIRA_API_VERSION", value_enum)]
+    pub api_version: Option<ApiVersionCli>,
 
     /// Transport for the MCP server: 'http' (default) or 'stdio'.
     #[arg(long, env = "MCP_TRANSPORT", value_enum, default_value = "http")]
@@ -113,6 +138,7 @@ impl std::fmt::Debug for Cli {
         f.debug_struct("Cli")
             .field("jira_server", &self.jira_server)
             .field("auth_mode", &self.auth_mode)
+            .field("api_version", &self.api_version)
             .field("transport", &self.transport)
             .field("host", &self.host)
             .field("port", &self.port)
@@ -141,6 +167,15 @@ pub enum TokenCustody {
 }
 
 impl Cli {
+    /// REST API version to use: explicit `--api-version` wins, otherwise the
+    /// auth mode decides (basic -> v3 Cloud, bearer -> v2 Data Center).
+    pub fn resolve_api_version(&self) -> jirakeep_core::client::ApiVersion {
+        match self.api_version {
+            Some(v) => v.into(),
+            None => jirakeep_core::client::ApiVersion::default_for(self.auth_mode.into()),
+        }
+    }
+
     pub fn resolve_token_custody(&self) -> anyhow::Result<TokenCustody> {
         let startup_key = self.api_key.as_deref().filter(|k| !k.is_empty());
         let key_file = self
@@ -330,6 +365,37 @@ mod tests {
         let tok = cli.resolve_token_custody().unwrap();
         assert!(matches!(tok, TokenCustody::Server(_)));
         assert!(cli.resolve_email(&tok).unwrap().is_none());
+    }
+
+    #[test]
+    fn api_version_defaults_by_auth_mode_and_flag_wins() {
+        use jirakeep_core::client::ApiVersion;
+        let cli = parse(&["--jira-server", "https://example.atlassian.net"]);
+        assert_eq!(cli.resolve_api_version(), ApiVersion::V3);
+        let cli = parse(&[
+            "--jira-server",
+            "https://jira.example.com",
+            "--auth-mode",
+            "bearer",
+        ]);
+        assert_eq!(cli.resolve_api_version(), ApiVersion::V2);
+        // Cloud OAuth bearer: explicit flag overrides the bearer default.
+        let cli = parse(&[
+            "--jira-server",
+            "https://example.atlassian.net",
+            "--auth-mode",
+            "bearer",
+            "--api-version",
+            "3",
+        ]);
+        assert_eq!(cli.resolve_api_version(), ApiVersion::V3);
+        let cli = parse(&[
+            "--jira-server",
+            "https://jira.example.com",
+            "--api-version",
+            "2",
+        ]);
+        assert_eq!(cli.resolve_api_version(), ApiVersion::V2);
     }
 
     #[test]

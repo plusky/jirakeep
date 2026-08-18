@@ -29,7 +29,8 @@ repository so tracker-specific invariants stay honest. See
 * **Audit stream** — operator-only JSONL (`--audit-config`); never on MCP.
 * **Two transports** — streamable HTTP and stdio.
 * **Auth** — Cloud Basic (email + API token) or Data Center Bearer PAT
-  (`--auth-mode bearer`).
+  (`--auth-mode bearer`); REST API version follows the auth mode
+  (basic → v3, bearer → v2) unless `--api-version {2,3}` overrides it.
 * **I14 link scrubbing** — denied issue keys removed from links/parent/subtasks
   and redacted in changelog strings.
 
@@ -79,7 +80,8 @@ cargo build --release -p jirakeep
   --api-key "$JIRA_API_TOKEN" \
   --policy examples/policy.toml
 
-# Data Center personal access token (Bearer)
+# Data Center personal access token (Bearer); targets /rest/api/2 by
+# default — pass --api-version 3 for Cloud OAuth-bearer setups
 ./target/release/jirakeep \
   --transport stdio \
   --auth-mode bearer \

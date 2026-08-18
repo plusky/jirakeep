@@ -25,6 +25,7 @@ fn cli(jira_server: &str) -> Arc<Cli> {
     Arc::new(Cli {
         jira_server: jira_server.to_owned(),
         auth_mode: AuthModeCli::Basic,
+        api_version: None,
         transport: Transport::Stdio,
         host: "127.0.0.1".into(),
         port: 8000,

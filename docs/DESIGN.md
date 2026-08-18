@@ -39,9 +39,19 @@ Dependency direction: `jirakeep -> jirakeep-core`, never the reverse.
 
 ## Backend scope (v1)
 
-- **In scope:** Jira REST API v3.
+- **In scope:** Jira REST API v3 (Cloud) and v2 (Data Center).
   - **Cloud:** Basic auth (`email` + API token) — default (`--auth-mode basic`).
   - **Data Center:** Bearer personal access token (`--auth-mode bearer`).
+- **API version selection is explicit and static:** `--api-version {2,3}` /
+  `JIRA_API_VERSION`; when absent, the auth mode decides (basic → 3,
+  bearer → 2). The explicit flag wins (Cloud OAuth bearer ⇒ `--auth-mode
+  bearer --api-version 3`). There is **no network autodetection** — no
+  startup probe exists, so there is no "detection failed" state to fail
+  closed on; a misconfigured version surfaces as ordinary Jira HTTP errors.
+  Guard semantics are identical across versions (I2, I3, I4): guard code
+  never branches on the version. v2 search is `POST /rest/api/2/search`
+  with `startAt` offset paging only; `nextPageToken` is null on v2 and the
+  v2 envelope's `total`/`startAt` never reach MCP clients (I3).
 - **Out of scope for v1:** OAuth 2.0 interactive flows, multi-tracker process,
   Confluence.
 

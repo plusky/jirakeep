@@ -573,6 +573,10 @@ pub struct Global {
     pub max_attachment_bytes: u64,
     /// Project keys declared publicly browsable by the operator.
     pub public_projects: Vec<String>,
+    /// Custom field ids (`customfield_<digits>`) whose string values are
+    /// issue keys — e.g. the classic/DC Epic Link field. Declared fields
+    /// join I14 link scrubbing; undeclared custom fields are never scanned.
+    pub link_custom_fields: Vec<String>,
 }
 
 impl Default for Global {
@@ -584,8 +588,16 @@ impl Default for Global {
             disabled_tools: Vec::new(),
             max_attachment_bytes: 2 * 1024 * 1024,
             public_projects: Vec::new(),
+            link_custom_fields: Vec::new(),
         }
     }
+}
+
+/// Exactly `customfield_<digits>` — the only shape `link_custom_fields`
+/// accepts, so a typo cannot silently skip a link carrier (I14).
+fn is_link_custom_field_id(s: &str) -> bool {
+    s.strip_prefix("customfield_")
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The full guard policy.
@@ -647,6 +659,14 @@ impl Policy {
     fn validate(&self) -> anyhow::Result<()> {
         if self.default_action == Action::Restrict {
             bail!("default_action must be \"allow\" or \"deny\", not \"restrict\"");
+        }
+        for field in &self.global.link_custom_fields {
+            if !is_link_custom_field_id(field) {
+                bail!(
+                    "global.link_custom_fields entry \"{field}\" is not a \
+                     customfield_<digits> id"
+                );
+            }
         }
         for rule in &self.rules {
             if rule.name.trim().is_empty() {
@@ -1088,6 +1108,26 @@ created_by_me = true
     #[test]
     fn unknown_key_rejected() {
         assert!(Policy::from_toml_str("default_action = \"allow\"\nnope = 1\n").is_err());
+    }
+
+    #[test]
+    fn link_custom_fields_accepts_only_customfield_ids() {
+        let p = Policy::from_toml_str(
+            "default_action = \"allow\"\n[global]\nlink_custom_fields = [\"customfield_10014\"]\n",
+        )
+        .unwrap();
+        assert_eq!(p.global.link_custom_fields, vec!["customfield_10014"]);
+        for bad in [
+            "epic_link",
+            "customfield_",
+            "customfield_10a14",
+            "Customfield_10014",
+            " customfield_10014",
+        ] {
+            let toml =
+                format!("default_action = \"allow\"\n[global]\nlink_custom_fields = [\"{bad}\"]\n");
+            assert!(Policy::from_toml_str(&toml).is_err(), "{bad:?} must fail");
+        }
     }
 
     #[test]

@@ -458,6 +458,8 @@ impl JiraKeep {
                 "allow_restricted_comments": p.global.allow_restricted_comments,
                 "disabled_tools": p.global.disabled_tools,
                 "public_projects_count": p.global.public_projects.len(),
+                // Count only — never the declared field ids (I1).
+                "link_custom_fields_count": p.global.link_custom_fields.len(),
             },
             "audit": self.audit.is_some(),
         })))
@@ -519,13 +521,15 @@ impl JiraKeep {
                             Err(_) => body.clone(),
                         };
                         // I14: scrub linked keys the client may not see.
-                        let mut candidates = Guard::linked_keys(&full);
+                        let link_fields = &self.guard.policy.global.link_custom_fields;
+                        let mut candidates = Guard::linked_keys(&full, link_fields);
                         candidates.insert(key.clone());
                         let disclosable = self
                             .guard
                             .disclosable(&self.jira, &creds, &candidates, caller.as_deref())
                             .await;
-                        let (scrubbed, removed) = Guard::scrub_links(&full, &disclosable);
+                        let (scrubbed, removed) =
+                            Guard::scrub_links(&full, &disclosable, link_fields);
                         // Capability-gated field families (attachment,
                         // comment, worklog) are not implied by Read (I6/I5).
                         let scrubbed = Guard::scrub_gated_fields(access, scrubbed);

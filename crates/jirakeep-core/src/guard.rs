@@ -297,7 +297,8 @@ impl Guard {
     /// JQL search with silent post-filter (I3) and linked-key scrubbing (I14).
     ///
     /// Issue keys referenced from served issues (`issuelinks`, `parent`,
-    /// `subtasks`) that are not positively disclosable — policy-denied,
+    /// `subtasks`, declared `link_custom_fields`) that are not positively
+    /// disclosable — policy-denied,
     /// unfetchable, or past the [`Guard::MAX_ASSESS_KEYS`] assessment bound —
     /// are removed from the served bodies and reported only via
     /// [`SearchWindow::scrubbed_keys`] (fail closed, I4).
@@ -337,9 +338,10 @@ impl Guard {
 
         // I14: keys referenced from served issues (issuelinks, parent,
         // subtasks) must themselves be disclosable; assess the unknown ones.
+        let link_fields = &self.policy.global.link_custom_fields;
         let mut candidates: BTreeSet<String> = BTreeSet::new();
         for issue in &visible {
-            candidates.extend(Self::linked_keys(issue));
+            candidates.extend(Self::linked_keys(issue, link_fields));
         }
         candidates.retain(|k| {
             !disclosable.iter().any(|d| d.eq_ignore_ascii_case(k))
@@ -353,7 +355,7 @@ impl Guard {
         }
         let mut scrubbed_keys: Vec<String> = Vec::new();
         for issue in &mut visible {
-            let (clean, removed) = Self::scrub_links(issue, &disclosable);
+            let (clean, removed) = Self::scrub_links(issue, &disclosable, link_fields);
             *issue = clean;
             scrubbed_keys.extend(removed);
         }
@@ -430,8 +432,11 @@ impl Guard {
     /// Collect issue keys referenced from a served issue body (I14 candidates).
     ///
     /// Sources: `fields.issuelinks` (inward/outward), `fields.parent`,
-    /// `fields.subtasks`. Free-text description/comments are not scanned.
-    pub fn linked_keys(issue: &Value) -> BTreeSet<String> {
+    /// `fields.subtasks`, and each operator-declared field in
+    /// `link_custom_fields` whose value is an issue-key string (e.g. the
+    /// classic/DC Epic Link field). Undeclared custom fields and free-text
+    /// description/comments are not scanned.
+    pub fn linked_keys(issue: &Value, link_custom_fields: &[String]) -> BTreeSet<String> {
         let mut keys = BTreeSet::new();
         let fields = issue.get("fields").unwrap_or(issue);
         if let Some(links) = fields.get("issuelinks").and_then(Value::as_array) {
@@ -458,6 +463,13 @@ impl Guard {
             for sub in subs {
                 if let Some(k) = sub.get("key").and_then(Value::as_str) {
                     keys.insert(k.to_owned());
+                }
+            }
+        }
+        for name in link_custom_fields {
+            if let Some(s) = fields.get(name).and_then(Value::as_str) {
+                if looks_like_issue_key(s) {
+                    keys.insert(s.trim().to_owned());
                 }
             }
         }
@@ -500,9 +512,16 @@ impl Guard {
     /// Remove links/parent/subtasks that name non-disclosable issues (I14).
     ///
     /// `disclosable` must include keys the client is already allowed to see
-    /// in this response (typically the requested key itself). Returns the
-    /// scrubbed issue and the keys that were removed (server-side only).
-    pub fn scrub_links(issue: &Value, disclosable: &BTreeSet<String>) -> (Value, Vec<String>) {
+    /// in this response (typically the requested key itself). Each declared
+    /// field in `link_custom_fields` is nulled unless its value is a
+    /// positively disclosable issue-key string — an unassessable value never
+    /// serves (I4). Returns the scrubbed issue and the keys that were
+    /// removed (server-side only, I3).
+    pub fn scrub_links(
+        issue: &Value,
+        disclosable: &BTreeSet<String>,
+        link_custom_fields: &[String],
+    ) -> (Value, Vec<String>) {
         let mut out = issue.clone();
         let mut scrubbed = Vec::new();
         let Some(fields) = out.get_mut("fields").and_then(Value::as_object_mut) else {
@@ -548,6 +567,28 @@ impl Guard {
                 }
                 true
             });
+        }
+
+        for name in link_custom_fields {
+            let Some(v) = fields.get_mut(name) else {
+                continue;
+            };
+            if v.is_null() {
+                continue;
+            }
+            let keep = v.as_str().is_some_and(|s| {
+                looks_like_issue_key(s)
+                    && disclosable.iter().any(|d| d.eq_ignore_ascii_case(s.trim()))
+            });
+            if !keep {
+                if let Some(s) = v.as_str() {
+                    if looks_like_issue_key(s) {
+                        scrubbed.push(s.trim().to_owned());
+                    }
+                }
+                // Null, not remove: an unset link field is null in Jira.
+                *v = Value::Null;
+            }
         }
 
         scrubbed.sort();
@@ -705,14 +746,14 @@ projects = ["SEC"]
                 "subtasks": [{"key": "OPEN-3"}, {"key": "SEC-2"}],
             }
         });
-        let keys = Guard::linked_keys(&issue);
+        let keys = Guard::linked_keys(&issue, &[]);
         assert!(keys.contains("SEC-9"));
         assert!(keys.contains("OPEN-2"));
         let mut allow = BTreeSet::new();
         allow.insert("OPEN-1".into());
         allow.insert("OPEN-2".into());
         allow.insert("OPEN-3".into());
-        let (scrubbed, removed) = Guard::scrub_links(&issue, &allow);
+        let (scrubbed, removed) = Guard::scrub_links(&issue, &allow, &[]);
         assert!(removed.iter().any(|k| k == "SEC-9"));
         assert!(removed.iter().any(|k| k == "SEC-1"));
         assert!(removed.iter().any(|k| k == "SEC-2"));
@@ -720,6 +761,56 @@ projects = ["SEC"]
         assert_eq!(links.len(), 1);
         assert!(scrubbed["fields"].get("parent").is_none());
         assert_eq!(scrubbed["fields"]["subtasks"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn declared_link_custom_fields_join_candidates_and_scrub() {
+        let declared = vec![
+            "customfield_10014".to_owned(),
+            "customfield_10500".to_owned(),
+        ];
+        let issue = json!({
+            "key": "PUB-7",
+            "fields": {
+                "customfield_10014": "SEC-100",
+                "customfield_10500": "PUB-8",
+                // Undeclared: never scanned, never touched.
+                "customfield_20000": "SEC-77",
+            }
+        });
+        let keys = Guard::linked_keys(&issue, &declared);
+        assert!(keys.contains("SEC-100"));
+        assert!(keys.contains("PUB-8"));
+        assert!(!keys.contains("SEC-77"));
+        let allow: BTreeSet<String> = BTreeSet::from(["PUB-7".into(), "PUB-8".into()]);
+        let (scrubbed, removed) = Guard::scrub_links(&issue, &allow, &declared);
+        assert_eq!(scrubbed["fields"]["customfield_10014"], Value::Null);
+        assert_eq!(scrubbed["fields"]["customfield_10500"], json!("PUB-8"));
+        assert_eq!(scrubbed["fields"]["customfield_20000"], json!("SEC-77"));
+        assert_eq!(removed, vec!["SEC-100".to_string()]);
+    }
+
+    #[test]
+    fn declared_link_custom_field_unreadable_value_nulls() {
+        // A declared link field carrying anything but a disclosable
+        // issue-key string cannot be assessed: null it (I4).
+        let declared = vec!["customfield_10014".to_owned()];
+        let allow: BTreeSet<String> = BTreeSet::from(["PUB-7".into()]);
+        for odd in [json!({"key": "SEC-100"}), json!("not a key"), json!(7)] {
+            let issue = json!({"key": "PUB-7", "fields": {"customfield_10014": odd}});
+            assert!(Guard::linked_keys(&issue, &declared).is_empty());
+            let (scrubbed, removed) = Guard::scrub_links(&issue, &allow, &declared);
+            assert_eq!(scrubbed["fields"]["customfield_10014"], Value::Null);
+            assert!(removed.is_empty());
+        }
+        // Null stays null; an absent field stays absent.
+        let issue = json!({"key": "PUB-7", "fields": {"customfield_10014": Value::Null}});
+        let (scrubbed, removed) = Guard::scrub_links(&issue, &allow, &declared);
+        assert_eq!(scrubbed["fields"]["customfield_10014"], Value::Null);
+        assert!(removed.is_empty());
+        let issue = json!({"key": "PUB-7", "fields": {}});
+        let (scrubbed, _) = Guard::scrub_links(&issue, &allow, &declared);
+        assert!(scrubbed["fields"].get("customfield_10014").is_none());
     }
 
     fn gated_issue() -> Value {

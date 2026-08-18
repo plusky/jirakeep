@@ -16,6 +16,11 @@ disabled_tools = []
 max_attachment_bytes = 2097152
 # Project keys the operator asserts are publicly browsable.
 public_projects = []
+# Custom fields whose string values are issue keys — e.g. the classic /
+# Data Center "Epic Link" field (instance-specific id). Declared fields are
+# scrubbed like issuelinks/parent/subtasks (I14); undeclared custom fields
+# are never scanned. Uncomment and adjust the id to use.
+# link_custom_fields = ["customfield_10014"]
 
 # Hide a security project entirely.
 [[rule]]

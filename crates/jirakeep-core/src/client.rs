@@ -154,6 +154,16 @@ impl JiraClient {
         &self.api_url
     }
 
+    /// Free text as a request body for this client's API version: v3 wraps
+    /// it in a minimal ADF doc, v2 sends the plain string. The only place
+    /// the text-to-body decision is made.
+    pub fn text_body(&self, text: &str) -> Value {
+        match self.api_version {
+            ApiVersion::V2 => Value::String(text.to_owned()),
+            ApiVersion::V3 => plain_to_adf(text),
+        }
+    }
+
     /// GET `/rest/api/{v}/myself` — returns the account object (`accountId`, …).
     pub async fn myself(&self, creds: &Credentials) -> Result<Value> {
         self.get_json(creds, "/myself", &[]).await
@@ -234,8 +244,7 @@ impl JiraClient {
         .await
     }
 
-    /// POST a comment. Body is Atlassian Document Format or plain text
-    /// converted to a simple ADF doc.
+    /// POST a comment. Plain text is encoded per [`Self::text_body`].
     pub async fn add_comment(
         &self,
         creds: &Credentials,
@@ -245,7 +254,7 @@ impl JiraClient {
     ) -> Result<Value> {
         let path = format!("/issue/{}/comment", urlencoding_path(key_or_id));
         let mut payload = json!({
-            "body": plain_to_adf(body_text),
+            "body": self.text_body(body_text),
         });
         if let Some(vis) = visibility {
             payload["visibility"] = vis;
@@ -455,7 +464,7 @@ impl JiraClient {
         }
         if let Some(c) = comment {
             payload["update"] = json!({
-                "comment": [{"add": {"body": plain_to_adf(c)}}]
+                "comment": [{"add": {"body": self.text_body(c)}}]
             });
         }
         self.send_json_empty_ok(reqwest::Method::POST, creds, &path, &payload)
@@ -830,6 +839,27 @@ mod tests {
         let v = plain_to_adf("hello");
         assert_eq!(v["type"], "doc");
         assert_eq!(v["content"][0]["content"][0]["text"], json!("hello"));
+    }
+
+    #[test]
+    fn text_body_follows_api_version() {
+        let ua = "jirakeep/0.0.0 (+test)";
+        let v3 = JiraClient::with_api_version(
+            "https://example.atlassian.net",
+            ua,
+            AuthMode::Basic,
+            ApiVersion::V3,
+        )
+        .expect("builds");
+        assert_eq!(v3.text_body("hi"), plain_to_adf("hi"));
+        let v2 = JiraClient::with_api_version(
+            "https://jira.example.com",
+            ua,
+            AuthMode::Bearer,
+            ApiVersion::V2,
+        )
+        .expect("builds");
+        assert_eq!(v2.text_body("hi"), json!("hi"));
     }
 
     #[test]

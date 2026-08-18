@@ -1226,7 +1226,8 @@ impl JiraKeep {
             "issuetype": {"name": p.issue_type},
         });
         if let Some(desc) = p.description {
-            fields["description"] = jirakeep_core::client::plain_to_adf(&desc);
+            // Version-correct body shape lives in the client, not here.
+            fields["description"] = self.jira.text_body(&desc);
         }
         if let Some(labels) = p.labels {
             fields["labels"] = json!(labels);

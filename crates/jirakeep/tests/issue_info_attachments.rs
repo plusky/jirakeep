@@ -172,6 +172,7 @@ async fn connect(jira_url: &str, policy_toml: &str) -> McpClient {
     let cli = Arc::new(Cli {
         jira_server: jira_url.to_owned(),
         auth_mode: AuthModeCli::Basic,
+        api_version: None,
         transport: Transport::Stdio,
         host: "127.0.0.1".into(),
         port: 0,

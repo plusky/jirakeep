@@ -7,6 +7,7 @@ jirakeep \- MCP server for Atlassian Jira Cloud with operator\-controlled securi
 \fBjirakeep\fR
 \fB\-\-jira\-server\fR <JIRA_SERVER>
 [\fB\-\-auth\-mode\fR <AUTH_MODE>]
+[\fB\-\-api\-version\fR <API_VERSION>]
 [\fB\-\-transport\fR <TRANSPORT>]
 [\fB\-\-host\fR <HOST>]
 [\fB\-\-port\fR <PORT>]
@@ -43,6 +44,19 @@ Authentication mode: \*(Aqbasic\*(Aq (Cloud email+token, default) or \*(Aqbearer
 basic: Cloud Basic auth: email + API token (default)
 .IP \(bu 2
 bearer: Bearer token: Data Center personal access token (email not required)
+.RE
+.TP
+\fB\-\-api\-version\fR \fI<API_VERSION>\fR
+Jira REST API version: \*(Aq2\*(Aq (Data Center) or \*(Aq3\*(Aq (Cloud). Defaults by auth mode: basic \-> 3, bearer \-> 2
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+2: `/rest/api/2` — Jira Data Center
+.IP \(bu 2
+3: `/rest/api/3` — Jira Cloud
 .RE
 .TP
 \fB\-\-transport\fR \fI<TRANSPORT>\fR [default: http]
@@ -117,6 +131,9 @@ Fallback for \fB\-\-jira\-server\fR.
 .TP
 .B JIRA_AUTH_MODE
 Fallback for \fB\-\-auth\-mode\fR.
+.TP
+.B JIRA_API_VERSION
+Fallback for \fB\-\-api\-version\fR.
 .TP
 .B MCP_TRANSPORT
 Fallback for \fB\-\-transport\fR.

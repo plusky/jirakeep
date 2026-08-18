@@ -61,8 +61,13 @@ pub fn jira_client(cli: &Cli) -> anyhow::Result<JiraClient> {
     use anyhow::Context as _;
     use jirakeep_core::client::AuthMode;
     let mode: AuthMode = cli.auth_mode.into();
-    JiraClient::with_auth_mode(&cli.jira_server, USER_AGENT, mode)
-        .context("failed to build Jira client")
+    JiraClient::with_api_version(
+        &cli.jira_server,
+        USER_AGENT,
+        mode,
+        cli.resolve_api_version(),
+    )
+    .context("failed to build Jira client")
 }
 
 fn ok_json(value: Value) -> CallToolResult {
@@ -1292,6 +1297,7 @@ mod tests {
         let cli = Arc::new(Cli {
             jira_server: "https://example.atlassian.net".into(),
             auth_mode: AuthModeCli::Basic,
+            api_version: None,
             transport: Transport::Http,
             host: "127.0.0.1".into(),
             port: 8000,

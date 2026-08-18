@@ -5,6 +5,10 @@
 //! - **Basic** — Cloud email + API token
 //! - **Bearer** — Data Center personal access token (or Cloud OAuth bearer)
 //!
+//! The REST API version is fixed at construction ([`ApiVersion`]): v3 is the
+//! Cloud surface, v2 the Data Center one. Guard semantics never depend on
+//! the version (I2, I3, I4).
+//!
 //! Errors are sanitized so credentials cannot leak (I12). The `User-Agent`
 //! is supplied by the caller (the binary), never derived from this crate's
 //! package name.
@@ -28,6 +32,34 @@ pub enum AuthMode {
     Bearer,
 }
 
+/// Jira REST API version a client targets, fixed at construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiVersion {
+    /// `/rest/api/2` — Jira Data Center.
+    V2,
+    /// `/rest/api/3` — Jira Cloud.
+    V3,
+}
+
+impl ApiVersion {
+    /// Default version for an auth mode: Basic (Cloud) ⇒ v3, Bearer (DC
+    /// PAT) ⇒ v2. Cloud OAuth-bearer setups pass an explicit version.
+    pub fn default_for(mode: AuthMode) -> Self {
+        match mode {
+            AuthMode::Basic => Self::V3,
+            AuthMode::Bearer => Self::V2,
+        }
+    }
+
+    /// URL path segment: `"2"` or `"3"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V2 => "2",
+            Self::V3 => "3",
+        }
+    }
+}
+
 /// Credentials for one Jira request.
 ///
 /// For [`AuthMode::Basic`], `email` must be non-empty. For
@@ -48,13 +80,14 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
-/// Async client for the Jira REST API v3.
+/// Async client for the Jira REST API (v3 Cloud, v2 Data Center).
 #[derive(Debug, Clone)]
 pub struct JiraClient {
     base_url: String,
     api_url: String,
     http: reqwest::Client,
     auth_mode: AuthMode,
+    api_version: ApiVersion,
 }
 
 impl JiraClient {
@@ -64,7 +97,24 @@ impl JiraClient {
     }
 
     /// Create a client with an explicit auth mode (Cloud Basic or DC Bearer).
+    /// The API version defaults per [`ApiVersion::default_for`].
     pub fn with_auth_mode(base_url: &str, user_agent: &str, auth_mode: AuthMode) -> Result<Self> {
+        Self::with_api_version(
+            base_url,
+            user_agent,
+            auth_mode,
+            ApiVersion::default_for(auth_mode),
+        )
+    }
+
+    /// Create a client pinned to an explicit REST API version (e.g. Cloud
+    /// OAuth bearer ⇒ [`AuthMode::Bearer`] + [`ApiVersion::V3`]).
+    pub fn with_api_version(
+        base_url: &str,
+        user_agent: &str,
+        auth_mode: AuthMode,
+        api_version: ApiVersion,
+    ) -> Result<Self> {
         if user_agent.trim().is_empty() {
             bail!("jira client: user_agent must name the calling program, and was blank");
         }
@@ -72,7 +122,7 @@ impl JiraClient {
         if base_url.is_empty() {
             bail!("jira client: base_url must not be empty");
         }
-        let api_url = format!("{base_url}/rest/api/3");
+        let api_url = format!("{base_url}/rest/api/{}", api_version.as_str());
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(user_agent)
@@ -83,6 +133,7 @@ impl JiraClient {
             api_url,
             http,
             auth_mode,
+            api_version,
         })
     }
 
@@ -94,11 +145,16 @@ impl JiraClient {
         &self.base_url
     }
 
-    pub fn api_v3_url(&self) -> &str {
+    pub fn api_version(&self) -> ApiVersion {
+        self.api_version
+    }
+
+    /// Versioned REST base, e.g. `https://host/rest/api/2`.
+    pub fn api_url(&self) -> &str {
         &self.api_url
     }
 
-    /// GET `/rest/api/3/myself` — returns the account object (`accountId`, …).
+    /// GET `/rest/api/{v}/myself` — returns the account object (`accountId`, …).
     pub async fn myself(&self, creds: &Credentials) -> Result<Value> {
         self.get_json(creds, "/myself", &[]).await
     }
@@ -113,7 +169,7 @@ impl JiraClient {
             .ok_or_else(|| anyhow!("jira /myself response carries no usable accountId"))
     }
 
-    /// GET `/rest/api/3/serverInfo`.
+    /// GET `/rest/api/{v}/serverInfo` — the path exists on both versions.
     pub async fn server_info(&self, creds: &Credentials) -> Result<Value> {
         let mut info = self.get_json(creds, "/serverInfo", &[]).await?;
         if let Some(obj) = info.as_object_mut() {
@@ -122,7 +178,7 @@ impl JiraClient {
         Ok(info)
     }
 
-    /// GET `/rest/api/3/issue/{keyOrId}` with optional fields projection.
+    /// GET `/rest/api/{v}/issue/{keyOrId}` with optional fields projection.
     pub async fn get_issue(
         &self,
         creds: &Credentials,
@@ -198,10 +254,14 @@ impl JiraClient {
             .await
     }
 
-    /// JQL search via POST `/rest/api/3/search/jql` (token pagination).
+    /// JQL search.
     ///
-    /// Falls back to legacy `/rest/api/3/search` with `startAt` if the jql
-    /// endpoint is unavailable (404).
+    /// v3: POST `/rest/api/3/search/jql` (token pagination), falling back
+    /// to legacy `/rest/api/3/search` with `startAt` if the jql endpoint is
+    /// unavailable (404). v2 (Data Center): POST `/rest/api/2/search`,
+    /// offset paging only — `next_page_token` is ignored (v2 never issues
+    /// one) and the response carries no `nextPageToken`. Callers must not
+    /// forward the v2 envelope's `total`/`startAt` to MCP clients (I3).
     pub async fn search(
         &self,
         creds: &Credentials,
@@ -212,37 +272,51 @@ impl JiraClient {
         start_at: Option<u32>,
     ) -> Result<Value> {
         let field_list: Vec<String> = fields.iter().map(|s| (*s).to_string()).collect();
-        // Prefer modern token-paginated endpoint.
-        let mut payload = json!({
-            "jql": jql,
-            "maxResults": max_results,
-            "fields": field_list,
-        });
-        if let Some(tok) = next_page_token {
-            payload["nextPageToken"] = json!(tok);
-        }
-        match self
-            .send_json(reqwest::Method::POST, creds, "/search/jql", &payload)
-            .await
-        {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                let msg = format!("{e:#}");
-                if msg.contains("404") || msg.contains("HTTP 404") {
-                    // Legacy offset pagination.
-                    let mut legacy = json!({
-                        "jql": jql,
-                        "maxResults": max_results,
-                        "fields": fields,
-                        "startAt": start_at.unwrap_or(0),
-                    });
-                    if let Some(obj) = legacy.as_object_mut() {
-                        obj.insert("fields".into(), json!(fields.to_vec()));
+        match self.api_version {
+            ApiVersion::V2 => {
+                let payload = json!({
+                    "jql": jql,
+                    "maxResults": max_results,
+                    "fields": field_list,
+                    "startAt": start_at.unwrap_or(0),
+                });
+                self.send_json(reqwest::Method::POST, creds, "/search", &payload)
+                    .await
+            }
+            ApiVersion::V3 => {
+                // Prefer modern token-paginated endpoint.
+                let mut payload = json!({
+                    "jql": jql,
+                    "maxResults": max_results,
+                    "fields": field_list,
+                });
+                if let Some(tok) = next_page_token {
+                    payload["nextPageToken"] = json!(tok);
+                }
+                match self
+                    .send_json(reqwest::Method::POST, creds, "/search/jql", &payload)
+                    .await
+                {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        if msg.contains("404") || msg.contains("HTTP 404") {
+                            // Legacy offset pagination.
+                            let mut legacy = json!({
+                                "jql": jql,
+                                "maxResults": max_results,
+                                "fields": fields,
+                                "startAt": start_at.unwrap_or(0),
+                            });
+                            if let Some(obj) = legacy.as_object_mut() {
+                                obj.insert("fields".into(), json!(fields.to_vec()));
+                            }
+                            self.send_json(reqwest::Method::POST, creds, "/search", &legacy)
+                                .await
+                        } else {
+                            Err(e)
+                        }
                     }
-                    self.send_json(reqwest::Method::POST, creds, "/search", &legacy)
-                        .await
-                } else {
-                    Err(e)
                 }
             }
         }
@@ -617,7 +691,40 @@ mod tests {
         let c = JiraClient::new("https://example.atlassian.net/", "jirakeep/0.0.0 (+test)")
             .expect("builds");
         assert_eq!(c.base_url(), "https://example.atlassian.net");
-        assert_eq!(c.api_v3_url(), "https://example.atlassian.net/rest/api/3");
+        assert_eq!(c.api_url(), "https://example.atlassian.net/rest/api/3");
+    }
+
+    #[test]
+    fn api_version_defaults_by_auth_mode() {
+        let c = JiraClient::with_auth_mode(
+            "https://jira.example.com",
+            "jirakeep/0.0.0 (+test)",
+            AuthMode::Bearer,
+        )
+        .expect("builds");
+        assert_eq!(c.api_version(), ApiVersion::V2);
+        assert_eq!(c.api_url(), "https://jira.example.com/rest/api/2");
+        let c = JiraClient::with_auth_mode(
+            "https://example.atlassian.net",
+            "jirakeep/0.0.0 (+test)",
+            AuthMode::Basic,
+        )
+        .expect("builds");
+        assert_eq!(c.api_version(), ApiVersion::V3);
+        assert_eq!(c.api_url(), "https://example.atlassian.net/rest/api/3");
+    }
+
+    #[test]
+    fn explicit_api_version_overrides_auth_mode_default() {
+        // Cloud OAuth bearer: Bearer auth on the v3 surface.
+        let c = JiraClient::with_api_version(
+            "https://example.atlassian.net",
+            "jirakeep/0.0.0 (+test)",
+            AuthMode::Bearer,
+            ApiVersion::V3,
+        )
+        .expect("builds");
+        assert_eq!(c.api_url(), "https://example.atlassian.net/rest/api/3");
     }
 
     #[test]

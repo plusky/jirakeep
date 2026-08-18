@@ -1,6 +1,6 @@
 //! HTTP-level integration tests for guard + client (wiremock).
 
-use jirakeep_core::client::{Credentials, JiraClient};
+use jirakeep_core::client::{AuthMode, Credentials, JiraClient};
 use jirakeep_core::guard::Guard;
 use jirakeep_core::policy::{Access, Capability, Policy};
 use serde_json::json;
@@ -176,6 +176,61 @@ async fn assess_fail_closed_on_missing_issue() {
         out["NOPE-1"].0,
         Access::Denied { ref rule } if rule == "unavailable"
     ));
+}
+
+/// REST v2 (Data Center) identity is name-based: `/myself` has no
+/// accountId, and `created_by_me` compares server-resolved usernames
+/// (issue #16). Unknown identity still denies (I4).
+#[tokio::test]
+async fn v2_created_by_me_grants_with_name_identity() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/myself"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "jdoe",
+            "key": "JIRAUSER10000",
+            "displayName": "J. Doe",
+        })))
+        .mount(&server)
+        .await;
+    let mut mine = issue("MINE-1", "OPEN", None);
+    mine["fields"]["reporter"] = json!({"name": "JDOE"});
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/issue/MINE-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mine))
+        .mount(&server)
+        .await;
+    let mut other = issue("OTHER-1", "OPEN", None);
+    other["fields"]["reporter"] = json!({"name": "alice"});
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/issue/OTHER-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(other))
+        .mount(&server)
+        .await;
+
+    let g = guard(
+        r#"
+default_action = "deny"
+[[rule]]
+name = "mine"
+action = "allow"
+[rule.match]
+created_by_me = true
+"#,
+    );
+    let c = JiraClient::with_auth_mode(&server.uri(), UA, AuthMode::Bearer).expect("client");
+    let caller = g.resolve_caller(&c, &creds()).await;
+    assert_eq!(caller.as_deref(), Some("jdoe"));
+    let out = g
+        .assess(
+            &c,
+            &creds(),
+            &["MINE-1".into(), "OTHER-1".into()],
+            caller.as_deref(),
+        )
+        .await;
+    assert!(out["MINE-1"].0.allows(Capability::Read));
+    assert!(matches!(out["OTHER-1"].0, Access::Denied { .. }));
 }
 
 /// I4: attachment metadata without a readable numeric `size` fails closed

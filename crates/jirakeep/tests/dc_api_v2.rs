@@ -231,3 +231,155 @@ async fn create_issue_description_is_plain_string_on_v2() {
     let _ = client.cancel().await;
     let _ = server.cancel().await;
 }
+
+/// Policy that consults caller identity (`created_by_me`).
+const IDENTITY_POLICY: &str = r#"
+default_action = "deny"
+[[rule]]
+name = "mine"
+action = "allow"
+[rule.match]
+created_by_me = true
+"#;
+
+/// Issue #16 preflight: server-held credentials + identity-consulting
+/// policy + unusable `/myself` must fail loudly, naming the endpoint and
+/// the consequence — without leaking the token (I12).
+#[tokio::test]
+async fn identity_preflight_fails_loudly_when_myself_is_unusable() {
+    let mock = MockServer::start().await;
+    // Cloud-shaped body on the v2 surface: no name/key → no identity.
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/myself"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"accountId": "acc-1"})))
+        .mount(&mock)
+        .await;
+    let cfg = cli(&mock.uri());
+    let policy = Policy::from_toml_str(IDENTITY_POLICY).expect("policy");
+    let guard = Arc::new(Guard::new(policy));
+    let jira = Arc::new(jira_client(&cfg).expect("jira client"));
+    let server = JiraKeep::new(cfg, guard, jira).expect("server");
+    let err = server
+        .preflight_identity()
+        .await
+        .expect_err("preflight must fail");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("/myself"), "no endpoint named: {msg}");
+    assert!(msg.contains("created_by_me"), "no consequence named: {msg}");
+    assert!(!msg.contains("DCPATTOKEN"), "token leaked: {msg}");
+}
+
+/// A policy without identity criteria never contacts `/myself` at startup.
+#[tokio::test]
+async fn preflight_is_skipped_without_identity_rules() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/myself"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let cfg = cli(&mock.uri());
+    let policy = Policy::from_toml_str("default_action = \"allow\"\n").expect("policy");
+    let guard = Arc::new(Guard::new(policy));
+    let jira = Arc::new(jira_client(&cfg).expect("jira client"));
+    let server = JiraKeep::new(cfg, guard, jira).expect("server");
+    server
+        .preflight_identity()
+        .await
+        .expect("preflight is a no-op");
+}
+
+/// The shipped binary bails at startup (stdio mode) when the preflight
+/// fails, instead of serving a silent blackout.
+#[tokio::test]
+async fn startup_errors_loudly_in_stdio_mode_on_identity_preflight_failure() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/myself"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = dir.path().join("policy.toml");
+    std::fs::write(&policy_path, IDENTITY_POLICY).expect("write policy");
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_jirakeep"))
+        .args([
+            "--jira-server",
+            &mock.uri(),
+            "--transport",
+            "stdio",
+            "--auth-mode",
+            "bearer",
+            "--api-key",
+            "DCPATTOKEN",
+            "--policy",
+            policy_path.to_str().expect("utf-8 path"),
+        ])
+        .env_remove("JIRA_API_VERSION")
+        .env_remove("JIRA_API_TOKEN_FILE")
+        .env_remove("JIRA_EMAIL")
+        .env_remove("JIRA_EMAIL_FILE")
+        .env_remove("MCP_READ_ONLY")
+        .env_remove("JIRAKEEP_AUDIT_CONFIG")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .expect("spawn jirakeep");
+    assert!(!out.status.success(), "startup must fail loudly");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("/myself"), "stderr: {stderr}");
+    assert!(!stderr.contains("DCPATTOKEN"), "token leaked: {stderr}");
+}
+
+/// Issue #16: v2 writes are name-based — assignment sends
+/// `{"assignee":{"name":…}}` and the watchers body is the JSON-encoded
+/// username string. v3 accountId shapes are pinned in server_mcp tests.
+#[tokio::test]
+async fn v2_assign_and_watcher_send_name_based_shapes() {
+    let mock = MockServer::start().await;
+    Mock::given(path_regex(r"^/rest/api/3/.*"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/rest/api/2/issue/{KEY}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_body()))
+        .mount(&mock)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/rest/api/2/issue/{KEY}")))
+        .and(body_json(json!({"fields": {"assignee": {"name": "jdoe"}}})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/rest/api/2/issue/{KEY}/watchers")))
+        .and(body_json(json!("jdoe")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let (client, server) = connect(&mock).await;
+    let assign = call(
+        &client,
+        "assign_issue",
+        json!({"key": KEY, "account_id": "jdoe"}),
+    )
+    .await;
+    assert_ne!(assign.is_error, Some(true), "{assign:?}");
+    let watch = call(
+        &client,
+        "add_watcher",
+        json!({"key": KEY, "account_id": "jdoe"}),
+    )
+    .await;
+    assert_ne!(watch.is_error, Some(true), "{watch:?}");
+
+    let _ = client.cancel().await;
+    let _ = server.cancel().await;
+    // MockServer::drop verifies the v2 wire shapes were hit exactly once.
+}

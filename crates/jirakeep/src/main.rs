@@ -43,6 +43,9 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(cli);
     let mut server = server::JiraKeep::new(cfg.clone(), guard, jira)
         .context("failed to build the MCP server")?;
+    // Fail loudly at startup when identity-consulting rules could never
+    // be satisfied; runtime denials stay silent (I4).
+    server.preflight_identity().await?;
 
     let audit = match &cfg.audit_config {
         Some(path) => {

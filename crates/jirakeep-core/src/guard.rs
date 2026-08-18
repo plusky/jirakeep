@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::Utc;
 use serde_json::{json, Map, Value};
 
-use crate::client::{Credentials, JiraClient, CLASSIFY_FIELDS};
+use crate::client::{ApiVersion, Credentials, JiraClient, CLASSIFY_FIELDS};
 use crate::policy::{Access, Capability, IssueMeta, Operation, Policy};
 
 /// Fields kept by the redacted summary-only projection.
@@ -60,13 +60,14 @@ impl Guard {
 
     pub const MAX_ASSESS_KEYS: usize = 25;
 
-    /// Resolve the caller's account id once per tool call when the policy
-    /// needs `created_by_me`.
+    /// Resolve the caller's server-verified identity (v3 `accountId`, v2
+    /// username) once per tool call when the policy needs `created_by_me`.
+    /// Unresolvable identity stays `None` and denies silently at runtime (I4).
     pub async fn resolve_caller(&self, jira: &JiraClient, creds: &Credentials) -> Option<String> {
         if !self.policy.needs_identity() {
             return None;
         }
-        match jira.account_id(creds).await {
+        match jira.caller_identity(creds).await {
             Ok(id) => Some(id),
             Err(err) => {
                 tracing::debug!(error = %err, "caller identity resolution failed");
@@ -148,6 +149,7 @@ impl Guard {
                         &issue,
                         caller,
                         &self.policy.global.public_projects,
+                        jira.api_version(),
                     );
                     (self.policy.classify(&meta, now, Operation::Access), issue)
                 }
@@ -269,6 +271,7 @@ impl Guard {
         &self,
         issues: &[Value],
         caller: Option<&str>,
+        api_version: ApiVersion,
     ) -> (Vec<Value>, Vec<String>) {
         let now = Utc::now();
         let mut visible = Vec::new();
@@ -279,8 +282,12 @@ impl Guard {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned();
-            let meta =
-                IssueMeta::from_jira_issue(issue, caller, &self.policy.global.public_projects);
+            let meta = IssueMeta::from_jira_issue(
+                issue,
+                caller,
+                &self.policy.global.public_projects,
+                api_version,
+            );
             let access = self.policy.classify(&meta, now, Operation::Access);
             match Self::project_issue(&access, issue) {
                 Some(v) => visible.push(v),
@@ -326,7 +333,7 @@ impl Guard {
             .cloned()
             .unwrap_or_default();
         let scanned = raw.len() as u32;
-        let (mut visible, dropped) = self.filter_issue_list(&raw, caller);
+        let (mut visible, dropped) = self.filter_issue_list(&raw, caller, jira.api_version());
         // Keys classified above as at least Summary-visible are disclosable
         // in this window without spending assessment budget on a re-fetch.
         let mut disclosable: BTreeSet<String> = visible
@@ -727,7 +734,7 @@ projects = ["SEC"]
             json!({"key":"SEC-1","fields":{"summary":"a","project":{"key":"SEC"},"status":{"name":"Open"},"created":"2020-01-01T00:00:00.000+0000"}}),
             json!({"key":"OPEN-1","fields":{"summary":"b","project":{"key":"OPEN"},"status":{"name":"Open"},"created":"2020-01-01T00:00:00.000+0000"}}),
         ];
-        let (vis, drop) = g.filter_issue_list(&issues, None);
+        let (vis, drop) = g.filter_issue_list(&issues, None, ApiVersion::V3);
         assert_eq!(vis.len(), 1);
         assert_eq!(vis[0]["key"], json!("OPEN-1"));
         assert_eq!(drop, vec!["SEC-1".to_string()]);

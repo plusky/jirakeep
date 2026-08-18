@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
 
-use jirakeep_core::client::{Credentials, JiraClient};
+use jirakeep_core::client::{ApiVersion, Credentials, JiraClient};
 use jirakeep_core::guard::Guard;
 use jirakeep_core::policy::{Access, Action, Capability, IssueMeta};
 use rmcp::{
@@ -246,7 +246,8 @@ pub struct TransitionParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AssignParams {
     pub key: String,
-    /// Account id to assign; omit or null to unassign.
+    /// Assignee id: an accountId on REST v3 (Cloud), a username on v2
+    /// (Data Center). Omit or null to unassign.
     #[serde(default)]
     pub account_id: Option<String>,
 }
@@ -263,6 +264,8 @@ pub struct UpdateFieldsParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WatcherParams {
     pub key: String,
+    /// Watcher id: an accountId on REST v3 (Cloud), a username on v2
+    /// (Data Center).
     pub account_id: String,
 }
 
@@ -359,6 +362,46 @@ impl JiraKeep {
     pub fn with_audit(mut self, audit: Arc<AuditState>) -> Self {
         self.audit = Some(audit);
         self
+    }
+
+    /// Startup identity preflight. A policy consulting `created_by_me` with
+    /// server-held credentials must resolve `/myself` now, so a broken
+    /// identity source fails loudly instead of serving a silent blackout;
+    /// per-request custody cannot preflight and gets one startup warning.
+    /// Runtime behavior is unchanged: unresolvable identity still denies
+    /// silently per request (I4). A policy without identity criteria never
+    /// contacts Jira here.
+    pub async fn preflight_identity(&self) -> anyhow::Result<()> {
+        if !self.guard.policy.needs_identity() {
+            return Ok(());
+        }
+        match &self.token_custody {
+            TokenCustody::Server(token) => {
+                let creds = Credentials {
+                    email: self.email.clone().unwrap_or_default(),
+                    token: token.clone(),
+                };
+                // Resolved identity value stays out of logs and errors (I12).
+                match self.jira.caller_identity(&creds).await {
+                    Ok(_) => Ok(()),
+                    Err(err) => anyhow::bail!(
+                        "identity preflight failed: GET {}/myself yielded no usable caller \
+                         identity ({err:#}); the policy consults created_by_me, so every \
+                         identity-consulting rule would deny all requests (I4) — fix the \
+                         credentials or --api-version, or drop the identity rules",
+                        self.jira.api_url()
+                    ),
+                }
+            }
+            TokenCustody::PerRequest => {
+                tracing::warn!(
+                    "policy consults created_by_me but credentials arrive per-request, so \
+                     identity cannot be verified at startup; if this deployment cannot \
+                     resolve /myself, identity-consulting rules will deny everything (I4)"
+                );
+                Ok(())
+            }
+        }
     }
 
     fn credentials(&self, ctx: &RequestContext<RoleServer>) -> Result<Credentials, McpError> {
@@ -1053,7 +1096,7 @@ impl JiraKeep {
     }
 
     #[tool(
-        description = "Assign an issue to an account id (or unassign with null account_id).",
+        description = "Assign an issue (or unassign with null account_id). account_id is an accountId on REST v3 (Cloud) and a username on v2 (Data Center).",
         annotations(read_only_hint = false, open_world_hint = true)
     )]
     async fn assign_issue(
@@ -1069,8 +1112,12 @@ impl JiraKeep {
         {
             return Ok(deny);
         }
+        // v2 assigns by username, v3 by accountId; unassign is null on both.
         let fields = match &p.account_id {
-            Some(id) => json!({"assignee": {"accountId": id}}),
+            Some(id) => match self.jira.api_version() {
+                ApiVersion::V2 => json!({"assignee": {"name": id}}),
+                ApiVersion::V3 => json!({"assignee": {"accountId": id}}),
+            },
             None => json!({"assignee": Value::Null}),
         };
         match self.jira.update_issue(&creds, &p.key, fields).await {
@@ -1115,7 +1162,7 @@ impl JiraKeep {
     }
 
     #[tool(
-        description = "Add a watcher (by account id) to an issue.",
+        description = "Add a watcher to an issue. account_id is an accountId on REST v3 (Cloud) and a username on v2 (Data Center).",
         annotations(read_only_hint = false, open_world_hint = true)
     )]
     async fn add_watcher(

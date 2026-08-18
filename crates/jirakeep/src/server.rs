@@ -159,6 +159,19 @@ fn refused_field(fields: &serde_json::Map<String, Value>) -> Option<&'static str
     None
 }
 
+/// Project a saved filter to caller-safe metadata. Sharing metadata
+/// (`sharePermissions`, `sharedUsers`, `subscriptions`) is never serialized.
+fn project_filter(filter: &Value) -> Value {
+    json!({
+        "id": filter.get("id"),
+        "name": filter.get("name"),
+        "description": filter.get("description"),
+        "jql": filter.get("jql"),
+        "owner": filter.get("owner").and_then(|o| o.get("displayName")),
+        "viewUrl": filter.get("viewUrl"),
+    })
+}
+
 // --- params -----------------------------------------------------------------
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -196,6 +209,18 @@ pub struct IssueHistoryParams {
 pub struct SearchParams {
     /// JQL query string.
     pub jql: String,
+    #[serde(default = "default_max")]
+    pub max_results: u32,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+    #[serde(default)]
+    pub start_at: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchFilterParams {
+    /// Saved filter id (numeric string from list_filters).
+    pub filter_id: String,
     #[serde(default = "default_max")]
     pub max_results: u32,
     #[serde(default)]
@@ -426,6 +451,54 @@ impl JiraKeep {
         } else {
             tracing::info!(issue = key, capability = ?cap, "guard denied operation");
             Some(err_text(Guard::denial(key)))
+        }
+    }
+
+    /// Execute JQL through the one guarded search path (I8): silent
+    /// filtering (I3), link scrubbing (I14), and audit scan counts are
+    /// identical for `issues_search` and `search_filter`.
+    async fn guarded_search(
+        &self,
+        creds: &Credentials,
+        jql: &str,
+        max_results: u32,
+        next_page_token: Option<&str>,
+        start_at: Option<u32>,
+        ctx: &RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let caller = self.guard.resolve_caller(&self.jira, creds).await;
+        match self
+            .guard
+            .search_filtered(
+                &self.jira,
+                creds,
+                jql,
+                max_results.min(50),
+                next_page_token,
+                start_at,
+                caller.as_deref(),
+            )
+            .await
+        {
+            Ok(window) => {
+                if let Some(cell) = audit_cell(ctx) {
+                    cell.note_verdict(Verdict::Filtered);
+                    cell.note_suppressed(window.dropped_keys.clone());
+                    cell.note_suppressed_count(window.dropped_keys.len() as u64);
+                    // I14: linked keys scrubbed from served issues are
+                    // audit-side only, never client-visible.
+                    if !window.scrubbed_keys.is_empty() {
+                        cell.note_suppressed(window.scrubbed_keys.clone());
+                    }
+                    cell.note_scan(u64::from(window.scanned), window.dropped_keys.len() as u64);
+                }
+                // I3: do not return scanned/dropped counts to the client.
+                ok_json(json!({
+                    "issues": window.issues,
+                    "nextPageToken": window.next_page_token,
+                }))
+            }
+            Err(e) => err_text(format!("search failed: {e:#}")),
         }
     }
 }
@@ -682,40 +755,68 @@ impl JiraKeep {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let creds = self.credentials(&ctx)?;
-        let caller = self.guard.resolve_caller(&self.jira, &creds).await;
-        match self
-            .guard
-            .search_filtered(
-                &self.jira,
+        Ok(self
+            .guarded_search(
                 &creds,
                 &p.jql,
-                p.max_results.min(50),
+                p.max_results,
                 p.next_page_token.as_deref(),
                 p.start_at,
-                caller.as_deref(),
+                &ctx,
             )
-            .await
-        {
-            Ok(window) => {
-                if let Some(cell) = audit_cell(&ctx) {
-                    cell.note_verdict(Verdict::Filtered);
-                    cell.note_suppressed(window.dropped_keys.clone());
-                    cell.note_suppressed_count(window.dropped_keys.len() as u64);
-                    // I14: linked keys scrubbed from served issues are
-                    // audit-side only, never client-visible.
-                    if !window.scrubbed_keys.is_empty() {
-                        cell.note_suppressed(window.scrubbed_keys.clone());
-                    }
-                    cell.note_scan(u64::from(window.scanned), window.dropped_keys.len() as u64);
-                }
-                // I3: do not return scanned/dropped counts to the client.
-                Ok(ok_json(json!({
-                    "issues": window.issues,
-                    "nextPageToken": window.next_page_token,
-                })))
+            .await)
+    }
+
+    #[tool(
+        description = "List the caller's favourite saved filters, projected to id, name, description, jql, owner, viewUrl. Sharing metadata is never returned.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn list_filters(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let creds = self.credentials(&ctx)?;
+        match self.jira.favourite_filters(&creds).await {
+            Ok(raw) => {
+                let filters: Vec<Value> = raw.iter().map(project_filter).collect();
+                Ok(ok_json(json!({ "filters": filters })))
             }
-            Err(e) => Ok(err_text(format!("search failed: {e:#}"))),
+            Err(e) => Ok(err_text(format!("filter list failed: {e:#}"))),
         }
+    }
+
+    #[tool(
+        description = "Run a saved filter by id: fetch its JQL and execute it through the same guarded search as issues_search (denied issues silently omitted).",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn search_filter(
+        &self,
+        Parameters(p): Parameters<SearchFilterParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let creds = self.credentials(&ctx)?;
+        let filter = match self.jira.get_filter(&creds, &p.filter_id).await {
+            Ok(v) => v,
+            Err(e) => return Ok(err_text(format!("filter fetch failed: {e:#}"))),
+        };
+        let jql = match filter
+            .get("jql")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(j) => j.to_owned(),
+            None => return Ok(err_text("filter has no JQL")),
+        };
+        Ok(self
+            .guarded_search(
+                &creds,
+                &jql,
+                p.max_results,
+                p.next_page_token.as_deref(),
+                p.start_at,
+                &ctx,
+            )
+            .await)
     }
 
     #[tool(
@@ -1297,6 +1398,12 @@ mod tests {
     use jirakeep_core::policy::Policy;
 
     fn test_server(read_only: bool) -> JiraKeep {
+        let mut policy = Policy::default();
+        policy.global.read_only |= read_only;
+        test_server_with(read_only, policy)
+    }
+
+    fn test_server_with(read_only: bool, policy: Policy) -> JiraKeep {
         use crate::config::AuthModeCli;
         let cli = Arc::new(Cli {
             jira_server: "https://example.atlassian.net".into(),
@@ -1315,8 +1422,6 @@ mod tests {
             policy: None,
             audit_config: None,
         });
-        let mut policy = Policy::default();
-        policy.global.read_only |= read_only;
         let guard = Arc::new(Guard::new(policy));
         let jira = Arc::new(jira_client(&cli).unwrap());
         JiraKeep::new(cli, guard, jira).unwrap()
@@ -1335,6 +1440,8 @@ mod tests {
             "mcp_server_info",
             "issue_info",
             "issues_search",
+            "list_filters",
+            "search_filter",
             "add_comment",
             "create_issue",
         ] {
@@ -1408,5 +1515,63 @@ mod tests {
             assert!(!names.iter().any(|n| n == w), "write tool {w} still listed");
         }
         assert!(names.iter().any(|n| n == "issue_info"));
+        // The saved-filter tools are reads and stay listed (I13).
+        assert!(names.iter().any(|n| n == "list_filters"));
+        assert!(names.iter().any(|n| n == "search_filter"));
+    }
+
+    #[test]
+    fn disabled_tools_accepts_and_removes_filter_tools() {
+        // I13: valid disabled_tools names, removed from the listing.
+        let mut policy = Policy::default();
+        policy.global.disabled_tools = vec!["list_filters".into(), "search_filter".into()];
+        let s = test_server_with(false, policy);
+        let names: Vec<_> = s
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == "list_filters"));
+        assert!(!names.iter().any(|n| n == "search_filter"));
+        assert!(names.iter().any(|n| n == "issues_search"));
+    }
+
+    #[test]
+    fn filter_projection_never_serializes_sharing_metadata() {
+        let raw = json!({
+            "id": "10042",
+            "name": "triage",
+            "description": "weekly triage",
+            "jql": "project = OPS",
+            "owner": {"displayName": "Alice", "accountId": "acc-1"},
+            "viewUrl": "https://example.atlassian.net/issues/?filter=10042",
+            "sharePermissions": [{"type": "group", "group": {"name": "staff"}}],
+            "sharedUsers": {"items": [{"accountId": "acc-2"}]},
+            "subscriptions": {"items": [{"user": {"accountId": "acc-3"}}]},
+        });
+        let projected = project_filter(&raw);
+        let keys: std::collections::BTreeSet<&str> = projected
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["id", "name", "description", "jql", "owner", "viewUrl"]
+                .into_iter()
+                .collect();
+        assert_eq!(keys, expected);
+        assert_eq!(projected["owner"], json!("Alice"));
+        let text = serde_json::to_string(&projected).expect("serializes");
+        for banned in [
+            "sharePermissions",
+            "sharedUsers",
+            "subscriptions",
+            "accountId",
+            "acc-1",
+        ] {
+            assert!(!text.contains(banned), "{banned} leaked: {text}");
+        }
     }
 }

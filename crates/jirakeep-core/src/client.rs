@@ -322,6 +322,27 @@ impl JiraClient {
         }
     }
 
+    /// GET `/rest/api/3/filter/favourite` — the caller's favourite saved
+    /// filters. Accepts both response shapes: a bare JSON array (Data
+    /// Center) and an object wrapping the list in `values`.
+    pub async fn favourite_filters(&self, creds: &Credentials) -> Result<Vec<Value>> {
+        let v = self.get_json(creds, "/filter/favourite", &[]).await?;
+        match v {
+            Value::Array(filters) => Ok(filters),
+            Value::Object(mut obj) => match obj.remove("values") {
+                Some(Value::Array(filters)) => Ok(filters),
+                _ => bail!("jira /filter/favourite response is not a filter list"),
+            },
+            _ => bail!("jira /filter/favourite response is not a filter list"),
+        }
+    }
+
+    /// GET `/rest/api/3/filter/{id}` — one saved filter (metadata incl. `jql`).
+    pub async fn get_filter(&self, creds: &Credentials, filter_id: &str) -> Result<Value> {
+        let path = format!("/filter/{}", urlencoding_path(filter_id));
+        self.get_json(creds, &path, &[]).await
+    }
+
     /// List attachment metadata from an issue (fields.attachment).
     pub async fn list_attachments(
         &self,

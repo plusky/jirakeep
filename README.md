@@ -44,6 +44,8 @@ repository so tracker-specific invariants stay honest. See
 | `issue_comments` | read |
 | `issue_history` | read |
 | `issues_search` | read (JQL) |
+| `list_filters` | read |
+| `search_filter` | read (saved JQL) |
 | `list_attachments` / `download_attachment` | read |
 | `issue_url` | local |
 | `summarize_issue` | read (prompt) |

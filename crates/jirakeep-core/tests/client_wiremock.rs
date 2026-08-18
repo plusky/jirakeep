@@ -198,6 +198,41 @@ async fn search_falls_back_to_legacy_on_404() {
 }
 
 #[tokio::test]
+async fn favourite_filters_accepts_bare_array() {
+    // Data Center serves /filter/favourite as a bare JSON array.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/filter/favourite"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": "10042", "name": "triage", "jql": "project = OPS"},
+        ])))
+        .mount(&server)
+        .await;
+
+    let c = basic_client(&server);
+    let filters = c.favourite_filters(&creds()).await.unwrap();
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0]["id"], json!("10042"));
+}
+
+#[tokio::test]
+async fn favourite_filters_accepts_object_shape() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/filter/favourite"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "values": [{"id": "10042", "name": "triage", "jql": "project = OPS"}],
+        })))
+        .mount(&server)
+        .await;
+
+    let c = basic_client(&server);
+    let filters = c.favourite_filters(&creds()).await.unwrap();
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0]["name"], json!("triage"));
+}
+
+#[tokio::test]
 async fn add_comment() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

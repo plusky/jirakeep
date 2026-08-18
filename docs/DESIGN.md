@@ -122,11 +122,17 @@ Numbering aligns with bugwarden where the spirit matches; wording is Jira-specif
   `global.disabled_tools`.
 - **I14** Issue keys the policy would deny must not appear inside something
   the client IS shown: `issuelinks`, `parent`, `subtasks` on served issues,
-  and changelog `from`/`to`/`fromString`/`toString` values that look like
-  issue keys. Bar is `Capability::Summary`. Candidate keys are assessed in
-  batch via `Guard::disclosable`; failed fetches scrub (I4). Free-text
-  description/comment bodies are not scanned (deliberate, unfixable
-  without destroying content).
+  operator-declared link custom fields, and changelog
+  `from`/`to`/`fromString`/`toString` values that look like issue keys.
+  Custom-field link carriers (e.g. the classic/DC Epic Link
+  `customfield_NNNNN`, whose value is a bare issue-key string) have
+  instance-specific ids the guard must never guess, so the set comes only
+  from `global.link_custom_fields`; undeclared custom fields are not
+  scanned. Bar is `Capability::Summary`. Candidate keys are assessed in
+  batch via `Guard::disclosable`; failed fetches scrub, and a declared
+  field's value is nulled unless it is a positively disclosable issue key
+  (I4). Free-text description/comment bodies are not scanned (deliberate,
+  unfixable without destroying content).
 - **I15** The audit stream is never reachable through any MCP surface.
   Records include tool calls (verdicts, suppressed keys, search scan
   counts) and `initialize` handshakes. Tokens, emails, and free-text issue
@@ -193,6 +199,7 @@ read_only = false
 disabled_tools = []
 max_attachment_bytes = 2097152
 public_projects = []         # keys declared publicly browsable
+link_custom_fields = []      # customfield_* ids carrying issue keys (I14)
 
 [[rule]]
 name = "example"

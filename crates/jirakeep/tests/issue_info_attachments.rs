@@ -3,6 +3,7 @@
 //! without `attachments`, comment bodies without `comments`, restricted
 //! comments ever (I5: no opt-in exists on this route), worklog always —
 //! while `list_attachments` / `issue_comments` stay uniformly denied (I2).
+//! Also pins I14 scrubbing of declared link custom fields on this route.
 //! Runs the library server over an in-process stdio-style transport against
 //! a wiremock Jira.
 
@@ -330,6 +331,65 @@ async fn issue_info_strips_comments_without_comments_capability() {
     assert_eq!(issue["fields"]["watches"]["watchCount"], json!(3));
     assert_eq!(issue["fields"]["votes"]["votes"], json!(1));
     assert_eq!(issue["fields"]["description"], json!("full body"));
+}
+
+/// Deny SEC; declare the classic Epic Link custom field for I14 scrubbing.
+const POLICY_EPIC_LINK: &str = r#"
+default_action = "allow"
+[global]
+link_custom_fields = ["customfield_10014"]
+[[rule]]
+name = "hide-sec"
+action = "deny"
+[rule.match]
+projects = ["SEC"]
+"#;
+
+/// I14: a denied epic key in a declared link custom field must not survive
+/// issue_info's unprojected Read body, and nothing reports the scrub (I3).
+#[tokio::test]
+async fn issue_info_scrubs_declared_epic_link_custom_field() {
+    let jira = MockServer::start().await;
+    let mut body = issue_body();
+    body["fields"]["customfield_10014"] = json!("SEC-100");
+    Mock::given(method("GET"))
+        .and(path(format!("/rest/api/3/issue/{ISSUE_KEY}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&jira)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/SEC-100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "key": "SEC-100",
+            "id": "7",
+            "fields": {
+                "summary": "codename embargo",
+                "project": {"key": "SEC"},
+                "created": "2020-01-01T00:00:00.000+0000",
+                "security": Value::Null,
+            }
+        })))
+        .mount(&jira)
+        .await;
+    let mut mcp = connect(&jira.uri(), POLICY_EPIC_LINK).await;
+
+    let result = mcp
+        .call_tool("issue_info", json!({"keys": [ISSUE_KEY]}))
+        .await;
+    assert_ne!(result.get("isError"), Some(&json!(true)), "{result}");
+    let text = tool_text(&result);
+    assert!(
+        !text.contains("SEC-100"),
+        "denied epic key leaked through a declared link custom field: {text}"
+    );
+    let payload: Value = serde_json::from_str(text).expect("payload is JSON");
+    let issue = &payload["issues"][0];
+    assert_eq!(issue["fields"]["customfield_10014"], Value::Null);
+    // Silent to the client (I3): nothing reports the removal.
+    assert!(payload["restricted"]
+        .as_array()
+        .expect("restricted array")
+        .is_empty());
 }
 
 #[tokio::test]

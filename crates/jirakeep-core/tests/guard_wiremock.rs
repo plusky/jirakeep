@@ -402,6 +402,79 @@ projects = ["SEC"]
 }
 
 #[tokio::test]
+async fn search_filtered_scrubs_declared_link_custom_fields() {
+    let server = MockServer::start().await;
+    // Classic/DC epic membership: a bare issue-key string in a custom field.
+    let mut pub7 = issue("PUB-7", "PUB", None);
+    pub7["fields"]["customfield_10014"] = json!("SEC-100");
+    pub7["fields"]["customfield_20000"] = json!("SEC-77"); // undeclared
+    let mut pub8 = issue("PUB-8", "PUB", None);
+    pub8["fields"]["customfield_10014"] = json!("GONE-9");
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/search/jql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issues": [pub7, pub8]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/SEC-100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue("SEC-100", "SEC", None)))
+        .mount(&server)
+        .await;
+    // GONE-9 cannot be fetched: fail closed, null the declared field (I4).
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/GONE-9"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let g = guard(
+        r#"
+default_action = "allow"
+[global]
+link_custom_fields = ["customfield_10014"]
+[[rule]]
+name = "hide"
+action = "deny"
+[rule.match]
+projects = ["SEC"]
+"#,
+    );
+    let window = g
+        .search_filtered(
+            &client(&server),
+            &creds(),
+            "project = PUB",
+            10,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(window.issues.len(), 2);
+    assert_eq!(
+        window.issues[0]["fields"]["customfield_10014"],
+        serde_json::Value::Null,
+        "denied epic key must be scrubbed from search results (I14)"
+    );
+    assert_eq!(
+        window.issues[1]["fields"]["customfield_10014"],
+        serde_json::Value::Null,
+        "unassessable epic key must scrub fail-closed (I4)"
+    );
+    // Undeclared custom fields are untouched: the set is operator-declared.
+    assert_eq!(
+        window.issues[0]["fields"]["customfield_20000"],
+        json!("SEC-77")
+    );
+    // Scrubbed keys stay on the audit side (I3).
+    assert_eq!(
+        window.scrubbed_keys,
+        vec!["GONE-9".to_string(), "SEC-100".into()]
+    );
+}
+
+#[tokio::test]
 async fn search_filtered_scrubs_linked_keys_past_assess_bound() {
     let server = MockServer::start().await;
     let total = Guard::MAX_ASSESS_KEYS + 5;

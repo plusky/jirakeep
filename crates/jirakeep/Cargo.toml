@@ -52,7 +52,7 @@ schemars = { version = "1", features = ["chrono04"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 toml = "1.1"
 
 clap = { version = "4", features = ["derive", "env"] }

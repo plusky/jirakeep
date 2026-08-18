@@ -179,6 +179,27 @@ impl JiraClient {
             .ok_or_else(|| anyhow!("jira /myself response carries no usable accountId"))
     }
 
+    /// Server-resolved caller identity from `/myself` for `created_by_me`
+    /// policy comparison: v3 `accountId`; v2 `name` (username), falling back
+    /// to `key`. Never client-declared. Errors when the response carries no
+    /// usable identifier for this API version.
+    pub async fn caller_identity(&self, creds: &Credentials) -> Result<String> {
+        let v = self.myself(creds).await?;
+        let pick = |field: &str| {
+            v.get(field)
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        };
+        match self.api_version {
+            ApiVersion::V2 => pick("name")
+                .or_else(|| pick("key"))
+                .ok_or_else(|| anyhow!("jira /myself response carries no usable name or key")),
+            ApiVersion::V3 => pick("accountId")
+                .ok_or_else(|| anyhow!("jira /myself response carries no usable accountId")),
+        }
+    }
+
     /// GET `/rest/api/{v}/serverInfo` — the path exists on both versions.
     pub async fn server_info(&self, creds: &Credentials) -> Result<Value> {
         let mut info = self.get_json(creds, "/serverInfo", &[]).await?;
@@ -508,21 +529,21 @@ impl JiraClient {
             .await
     }
 
-    /// Add watcher by account id.
+    /// Add watcher. `user_id` is an `accountId` on v3 and a username on v2;
+    /// both versions take the JSON-encoded id string as the body.
     pub async fn add_watcher(
         &self,
         creds: &Credentials,
         key_or_id: &str,
-        account_id: &str,
+        user_id: &str,
     ) -> Result<()> {
         let path = format!("/issue/{}/watchers", urlencoding_path(key_or_id));
-        // Body is a JSON string of the account id.
         let rb = self.apply_auth(
             self.http
                 .post(format!("{}{}", self.api_url, path))
                 .header(reqwest::header::ACCEPT, "application/json")
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(format!("\"{account_id}\"")),
+                .body(Value::String(user_id.to_owned()).to_string()),
             creds,
         );
         let (status, body) = self.send(rb, "POST", &path).await?;

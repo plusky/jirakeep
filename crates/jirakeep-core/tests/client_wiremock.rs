@@ -40,6 +40,58 @@ async fn myself_and_account_id() {
     let me = c.myself(&creds()).await.expect("myself");
     assert_eq!(me["accountId"], json!("acc-1"));
     assert_eq!(c.account_id(&creds()).await.unwrap(), "acc-1");
+    // v3 caller identity is the accountId.
+    assert_eq!(c.caller_identity(&creds()).await.unwrap(), "acc-1");
+}
+
+#[tokio::test]
+async fn caller_identity_v2_resolves_name_with_key_fallback() {
+    // DC /myself has name/key, never accountId (issue #16).
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/myself"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "jdoe",
+            "key": "JIRAUSER10000",
+            "displayName": "J. Doe",
+        })))
+        .mount(&server)
+        .await;
+    let c = bearer_client(&server);
+    assert_eq!(c.caller_identity(&creds()).await.unwrap(), "jdoe");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/myself"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"key": "JIRAUSER10000"})))
+        .mount(&server)
+        .await;
+    let c = bearer_client(&server);
+    assert_eq!(c.caller_identity(&creds()).await.unwrap(), "JIRAUSER10000");
+}
+
+#[tokio::test]
+async fn caller_identity_errors_when_version_field_is_missing() {
+    // A Cloud-shaped body on v2 (and vice versa) is unusable identity.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/myself"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"accountId": "acc-1"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/myself"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": "jdoe"})))
+        .mount(&server)
+        .await;
+    assert!(bearer_client(&server)
+        .caller_identity(&creds())
+        .await
+        .is_err());
+    assert!(basic_client(&server)
+        .caller_identity(&creds())
+        .await
+        .is_err());
 }
 
 #[tokio::test]

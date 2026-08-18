@@ -16,6 +16,8 @@ use anyhow::{bail, Context as _};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 
+use crate::client::ApiVersion;
+
 /// Declares [`Capability`] and [`Capability::ALL`] from a single variant
 /// list, so `ALL` structurally cannot omit a variant: adding a capability
 /// here extends the enum and `ALL` in the same edit, and every exhaustive
@@ -264,12 +266,15 @@ impl IssueMeta {
 
     /// Build metadata from a Jira issue JSON object.
     ///
-    /// `caller_account_id` is the Cloud `accountId` from `/myself` when
-    /// resolved; compared to `fields.reporter.accountId`.
+    /// `caller` is the server-resolved `/myself` identity (v3 `accountId`,
+    /// v2 `name` or `key`), compared case-insensitively to the same
+    /// version's reporter identifier. A missing reporter identifier leaves
+    /// `created_by_me` unknown, which denies when consulted (I4).
     pub fn from_jira_issue(
         issue: &Value,
-        caller_account_id: Option<&str>,
+        caller: Option<&str>,
         public_projects: &[String],
+        api_version: ApiVersion,
     ) -> Self {
         let fields = issue.get("fields").unwrap_or(issue);
         let project = fields
@@ -324,11 +329,21 @@ impl IssueMeta {
             .and_then(Value::as_str)
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
-        let reporter_id = fields
-            .get("reporter")
-            .and_then(|r| r.get("accountId"))
-            .and_then(Value::as_str);
-        let created_by_me = match (caller_account_id, reporter_id) {
+        // Version-appropriate reporter identifier: v2 carries name/key,
+        // v3 accountId. Never mix across versions — a wrong-field match
+        // must stay unknown, not become known-false (I4).
+        let reporter = fields.get("reporter");
+        let reporter_str = |field: &str| {
+            reporter
+                .and_then(|r| r.get(field))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+        };
+        let reporter_id = match api_version {
+            ApiVersion::V2 => reporter_str("name").or_else(|| reporter_str("key")),
+            ApiVersion::V3 => reporter_str("accountId"),
+        };
+        let created_by_me = match (caller, reporter_id) {
             (Some(caller), Some(rep)) => Some(caller.eq_ignore_ascii_case(rep)),
             _ => None,
         };
@@ -839,7 +854,7 @@ projects = ["SEC*"]
 "#,
         )
         .unwrap();
-        let meta = IssueMeta::from_jira_issue(&issue_json("SEC", None), None, &[]);
+        let meta = IssueMeta::from_jira_issue(&issue_json("SEC", None), None, &[], ApiVersion::V3);
         let a = p.classify(&meta, Utc::now(), Operation::Access);
         assert!(!a.allows(Capability::Read));
     }
@@ -859,13 +874,21 @@ project_public = true
 "#,
         )
         .unwrap();
-        let meta =
-            IssueMeta::from_jira_issue(&issue_json("OPEN", None), None, &p.global.public_projects);
+        let meta = IssueMeta::from_jira_issue(
+            &issue_json("OPEN", None),
+            None,
+            &p.global.public_projects,
+            ApiVersion::V3,
+        );
         assert!(p
             .classify(&meta, Utc::now(), Operation::Access)
             .allows(Capability::Read));
-        let meta2 =
-            IssueMeta::from_jira_issue(&issue_json("PRIV", None), None, &p.global.public_projects);
+        let meta2 = IssueMeta::from_jira_issue(
+            &issue_json("PRIV", None),
+            None,
+            &p.global.public_projects,
+            ApiVersion::V3,
+        );
         assert!(!p
             .classify(&meta2, Utc::now(), Operation::Access)
             .allows(Capability::Read));
@@ -884,7 +907,12 @@ security_levels = ["*Embargo*"]
 "#,
         )
         .unwrap();
-        let meta = IssueMeta::from_jira_issue(&issue_json("X", Some("Red Embargo")), None, &[]);
+        let meta = IssueMeta::from_jira_issue(
+            &issue_json("X", Some("Red Embargo")),
+            None,
+            &[],
+            ApiVersion::V3,
+        );
         assert!(!p
             .classify(&meta, Utc::now(), Operation::Access)
             .allows(Capability::Summary));
@@ -899,12 +927,12 @@ security_levels = ["*Embargo*"]
         // Object without a readable name (e.g. permission-trimmed response).
         let mut v = issue_json("X", None);
         v["fields"]["security"] = json!({"id": "10001", "self": "https://j/securitylevel/10001"});
-        let meta = IssueMeta::from_jira_issue(&v, None, &[]);
+        let meta = IssueMeta::from_jira_issue(&v, None, &[], ApiVersion::V3);
         assert_eq!(meta.security_level, SecurityLevel::Unreadable);
         assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::Unknown);
         // Non-object shape.
         v["fields"]["security"] = json!("high");
-        let meta = IssueMeta::from_jira_issue(&v, None, &[]);
+        let meta = IssueMeta::from_jira_issue(&v, None, &[], ApiVersion::V3);
         assert_eq!(meta.security_level, SecurityLevel::Unreadable);
         assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::Unknown);
         // Unknown in both polarities — never Yes/No.
@@ -924,15 +952,20 @@ security_levels = ["*Embargo*"]
         // Key missing entirely.
         let mut v = issue_json("X", None);
         v["fields"].as_object_mut().unwrap().remove("security");
-        let meta = IssueMeta::from_jira_issue(&v, None, &[]);
+        let meta = IssueMeta::from_jira_issue(&v, None, &[], ApiVersion::V3);
         assert_eq!(meta.security_level, SecurityLevel::Absent);
         assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::Yes);
         // Explicit null.
-        let meta = IssueMeta::from_jira_issue(&issue_json("X", None), None, &[]);
+        let meta = IssueMeta::from_jira_issue(&issue_json("X", None), None, &[], ApiVersion::V3);
         assert_eq!(meta.security_level, SecurityLevel::Absent);
         assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::Yes);
         // A named level is known-present and fails `has_security_level = false`.
-        let meta = IssueMeta::from_jira_issue(&issue_json("X", Some("Embargo")), None, &[]);
+        let meta = IssueMeta::from_jira_issue(
+            &issue_json("X", Some("Embargo")),
+            None,
+            &[],
+            ApiVersion::V3,
+        );
         assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::No);
     }
 
@@ -954,12 +987,12 @@ has_security_level = false
         .unwrap();
         let mut v = issue_json("X", None);
         v["fields"]["security"] = json!({"id": "10001"});
-        let meta = IssueMeta::from_jira_issue(&v, None, &[]);
+        let meta = IssueMeta::from_jira_issue(&v, None, &[], ApiVersion::V3);
         assert!(!p
             .classify(&meta, Utc::now(), Operation::Access)
             .allows(Capability::Summary));
         // A genuinely level-free issue still matches the allow rule.
-        let meta2 = IssueMeta::from_jira_issue(&issue_json("X", None), None, &[]);
+        let meta2 = IssueMeta::from_jira_issue(&issue_json("X", None), None, &[], ApiVersion::V3);
         assert!(p
             .classify(&meta2, Utc::now(), Operation::Access)
             .allows(Capability::Read));
@@ -973,13 +1006,13 @@ has_security_level = false
         };
         // Absence is knowledge of absence even when the project is unknown.
         let v = json!({"key": "X-1", "fields": {"summary": "t"}});
-        let meta = IssueMeta::from_jira_issue(&v, None, &[]);
+        let meta = IssueMeta::from_jira_issue(&v, None, &[], ApiVersion::V3);
         assert!(meta.project.is_none());
         assert_eq!(matcher.evaluate(&meta, Utc::now()), MatchOutcome::Yes);
         // An unreadable level stays unknown even when the project IS known.
         let mut v2 = issue_json("X", None);
         v2["fields"]["security"] = json!(7);
-        let meta2 = IssueMeta::from_jira_issue(&v2, None, &[]);
+        let meta2 = IssueMeta::from_jira_issue(&v2, None, &[], ApiVersion::V3);
         assert!(meta2.project.is_some());
         assert_eq!(matcher.evaluate(&meta2, Utc::now()), MatchOutcome::Unknown);
     }
@@ -997,7 +1030,7 @@ created_by_me = false
 "#,
         )
         .unwrap();
-        let meta = IssueMeta::from_jira_issue(&issue_json("X", None), None, &[]);
+        let meta = IssueMeta::from_jira_issue(&issue_json("X", None), None, &[], ApiVersion::V3);
         // created_by_me unknown → Unknown on deny rule → Denied
         assert!(!p
             .classify(&meta, Utc::now(), Operation::Access)
@@ -1016,19 +1049,22 @@ min_issue_age_days = 7
         .unwrap();
         let now = Utc::now();
         // Issue younger than the threshold: quarantined on access.
-        let mut young = IssueMeta::from_jira_issue(&issue_json("OPEN", None), None, &[]);
+        let mut young =
+            IssueMeta::from_jira_issue(&issue_json("OPEN", None), None, &[], ApiVersion::V3);
         young.creation_time = Some(now - Duration::days(1));
         assert!(!p
             .classify(&young, now, Operation::Access)
             .allows(Capability::Summary));
         // Unreadable `created` fails closed on access (I4).
-        let mut unreadable = IssueMeta::from_jira_issue(&issue_json("OPEN", None), None, &[]);
+        let mut unreadable =
+            IssueMeta::from_jira_issue(&issue_json("OPEN", None), None, &[], ApiVersion::V3);
         unreadable.creation_time = None;
         assert!(!p
             .classify(&unreadable, now, Operation::Access)
             .allows(Capability::Summary));
         // An issue older than the threshold reads normally.
-        let mut old = IssueMeta::from_jira_issue(&issue_json("OPEN", None), None, &[]);
+        let mut old =
+            IssueMeta::from_jira_issue(&issue_json("OPEN", None), None, &[], ApiVersion::V3);
         old.creation_time = Some(now - Duration::days(30));
         assert!(p
             .classify(&old, now, Operation::Access)
@@ -1085,21 +1121,48 @@ created_by_me = true
 "#,
         )
         .unwrap();
-        let meta = IssueMeta::from_jira_issue(&issue_json("X", None), Some("user-1"), &[]);
+        let meta =
+            IssueMeta::from_jira_issue(&issue_json("X", None), Some("user-1"), &[], ApiVersion::V3);
         assert!(p
             .classify(&meta, Utc::now(), Operation::Access)
             .allows(Capability::Read));
-        let meta2 = IssueMeta::from_jira_issue(&issue_json("X", None), Some("other"), &[]);
+        let meta2 =
+            IssueMeta::from_jira_issue(&issue_json("X", None), Some("other"), &[], ApiVersion::V3);
         assert!(!p
             .classify(&meta2, Utc::now(), Operation::Access)
             .allows(Capability::Read));
     }
 
     #[test]
+    fn created_by_me_uses_version_appropriate_reporter_identifier() {
+        // v2 reporter carries name (username), no accountId (issue #16).
+        let mut v2 = issue_json("X", None);
+        v2["fields"]["reporter"] = json!({"name": "JDoe", "key": "JIRAUSER10000"});
+        let meta = IssueMeta::from_jira_issue(&v2, Some("jdoe"), &[], ApiVersion::V2);
+        assert_eq!(meta.created_by_me, Some(true)); // case-insensitive
+        let meta = IssueMeta::from_jira_issue(&v2, Some("alice"), &[], ApiVersion::V2);
+        assert_eq!(meta.created_by_me, Some(false));
+        // Name absent: v2 falls back to the reporter key.
+        let mut keyed = issue_json("X", None);
+        keyed["fields"]["reporter"] = json!({"key": "JIRAUSER10000"});
+        let meta = IssueMeta::from_jira_issue(&keyed, Some("jirauser10000"), &[], ApiVersion::V2);
+        assert_eq!(meta.created_by_me, Some(true));
+        // Never mix across versions: a v3 comparison must not consult a
+        // name-only reporter — that stays unknown and denies when
+        // consulted (I4), never known-false.
+        let meta = IssueMeta::from_jira_issue(&v2, Some("jdoe"), &[], ApiVersion::V3);
+        assert_eq!(meta.created_by_me, None);
+        // And v2 ignores an accountId-only reporter the same way.
+        let meta =
+            IssueMeta::from_jira_issue(&issue_json("X", None), Some("user-1"), &[], ApiVersion::V2);
+        assert_eq!(meta.created_by_me, None);
+    }
+
+    #[test]
     fn read_only_strips_writes() {
         let mut p = Policy::default();
         p.global.read_only = true;
-        let meta = IssueMeta::from_jira_issue(&issue_json("X", None), None, &[]);
+        let meta = IssueMeta::from_jira_issue(&issue_json("X", None), None, &[], ApiVersion::V3);
         let a = p.classify(&meta, Utc::now(), Operation::Access);
         assert!(a.allows(Capability::Read));
         assert!(!a.allows(Capability::Comment));

@@ -400,3 +400,44 @@ async fn create_issue_description_is_adf_on_v3() {
     assert_eq!(body["key"], json!("OPS-2"));
     shutdown(client, server).await;
 }
+
+/// v3 (Cloud) write shapes stay accountId-based: issue #16 changed only
+/// the v2 wire shapes.
+#[tokio::test]
+async fn v3_assign_and_watcher_send_account_id_shapes() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/rest/api/3/issue/{KEY}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(classification_body()))
+        .mount(&mock)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/rest/api/3/issue/{KEY}")))
+        .and(body_json(
+            json!({"fields": {"assignee": {"accountId": "5b10ac8d"}}}),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/rest/api/3/issue/{KEY}/watchers")))
+        .and(body_json(json!("5b10ac8d")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let (client, server) = connect(&mock).await;
+    for tool in ["assign_issue", "add_watcher"] {
+        let args = json!({"key": KEY, "account_id": "5b10ac8d"});
+        let args = args.as_object().cloned().expect("arguments object");
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(args))
+            .await
+            .unwrap_or_else(|e| panic!("tools/call {tool}: {e}"));
+        assert_ne!(result.is_error, Some(true), "{tool}: {result:?}");
+    }
+    shutdown(client, server).await;
+    // MockServer::drop verifies the accountId wire shapes were hit once each.
+}

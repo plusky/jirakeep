@@ -48,10 +48,34 @@ Dependency direction: `jirakeep -> jirakeep-core`, never the reverse.
   bearer --api-version 3`). There is **no network autodetection** — no
   startup probe exists, so there is no "detection failed" state to fail
   closed on; a misconfigured version surfaces as ordinary Jira HTTP errors.
-  Guard semantics are identical across versions (I2, I3, I4): guard code
-  never branches on the version. v2 search is `POST /rest/api/2/search`
+  Guard *decision* semantics are identical across versions (I2, I3, I4):
+  denial text, silent filtering, and fail-closed handling never depend on
+  the version. v2 search is `POST /rest/api/2/search`
   with `startAt` offset paging only; `nextPageToken` is null on v2 and the
   v2 envelope's `total`/`startAt` never reach MCP clients (I3).
+- **Version-dependent identity — always server-resolved, never
+  client-declared.** The account model differs (v2/Data Center is
+  name-based; v3/Cloud uses `accountId`), so exactly three narrow spots
+  branch on the API version:
+  1. Caller identity resolves from `/myself` via one client method
+     (`JiraClient::caller_identity`): `name`, falling back to `key`, on
+     v2; `accountId` on v3.
+  2. `IssueMeta` extracts the version-appropriate reporter identifier for
+     `created_by_me` (v2 `reporter.name` falling back to `reporter.key`,
+     v3 `reporter.accountId`); comparison is case-insensitive and never
+     mixes identifiers across versions — a wrong-field miss stays unknown
+     and denies when consulted (I4).
+  3. Write shapes: on v2 `assign_issue` sends `{"assignee": {"name": …}}`
+     and `add_watcher` posts the JSON-encoded username; v3 shapes are
+     unchanged (`accountId`). The tools' `account_id` parameter is an
+     accountId on v3 and a username on v2.
+  **Startup identity preflight:** when the loaded policy consults identity
+  (`Policy::needs_identity()`) and credentials are server-held, `/myself`
+  is resolved once at startup and an unresolvable identity aborts with a
+  loud error naming the endpoint and the consequence; per-request
+  credential custody cannot preflight and instead logs one prominent
+  startup warning. Runtime I4 behavior is unchanged either way: an
+  unresolvable identity still denies silently per request.
 - **Out of scope for v1:** OAuth 2.0 interactive flows, multi-tracker process,
   Confluence.
 

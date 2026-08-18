@@ -16,7 +16,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, RoleServer, ServiceExt as _};
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const KEY: &str = "OPS-1";
@@ -91,8 +91,18 @@ async fn connect(
     RunningService<RoleClient, ()>,
     RunningService<RoleServer, JiraKeep>,
 ) {
+    connect_with_policy(mock, "default_action = \"allow\"\n").await
+}
+
+async fn connect_with_policy(
+    mock: &MockServer,
+    policy_toml: &str,
+) -> (
+    RunningService<RoleClient, ()>,
+    RunningService<RoleServer, JiraKeep>,
+) {
     let cfg = cli(&mock.uri());
-    let policy = Policy::from_toml_str("default_action = \"allow\"\n").expect("policy");
+    let policy = Policy::from_toml_str(policy_toml).expect("policy");
     let guard = Arc::new(Guard::new(policy));
     let jira = Arc::new(jira_client(&cfg).expect("jira client"));
     let server = JiraKeep::new(cfg, guard, jira).expect("server");
@@ -210,4 +220,135 @@ async fn update_issue_fields_permits_ordinary_edit() {
     assert_eq!(body["key"], json!(KEY));
     shutdown(client, server).await;
     // MockServer::drop verifies exactly one edit request went through.
+}
+
+/// A search-result issue with the classify fields the guard filters on.
+fn search_issue(key: &str, project: &str) -> Value {
+    json!({
+        "key": key,
+        "id": "1",
+        "fields": {
+            "summary": "s",
+            "project": {"key": project},
+            "status": {"name": "Open"},
+            "priority": {"name": "Medium"},
+            "issuetype": {"name": "Bug"},
+            "labels": [],
+            "components": [],
+            "created": "2020-01-01T00:00:00.000+0000",
+            "reporter": {"accountId": "u1"},
+            "security": Value::Null,
+        }
+    })
+}
+
+/// `search_filter` executes the saved filter's JQL through the same guarded
+/// search path as `issues_search`: policy-denied issues vanish silently and
+/// the response carries only `issues` + `nextPageToken` — no counts (I3).
+#[tokio::test]
+async fn search_filter_runs_filter_jql_through_the_guarded_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/filter/10042"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "10042",
+            "name": "triage",
+            "jql": "project in (OPS, SEC)",
+            "sharePermissions": [{"type": "group"}],
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // Pins that the filter's stored JQL — not client-supplied text — runs.
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/search/jql"))
+        .and(body_partial_json(json!({"jql": "project in (OPS, SEC)"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issues": [search_issue("OPS-7", "OPS"), search_issue("SEC-9", "SEC")],
+            "nextPageToken": "tok",
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let (client, server) = connect_with_policy(
+        &mock,
+        r#"
+default_action = "allow"
+[[rule]]
+name = "hide-sec"
+action = "deny"
+[rule.match]
+projects = ["SEC"]
+"#,
+    )
+    .await;
+
+    let args = json!({"filter_id": "10042"});
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_filter")
+                .with_arguments(args.as_object().cloned().expect("arguments object")),
+        )
+        .await
+        .expect("tools/call search_filter");
+
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let text = result_text(&result);
+    assert!(!text.contains("SEC-9"), "denied issue served: {text}");
+    let body: Value = serde_json::from_str(text).expect("json body");
+    // Identical shape to issues_search: issues + nextPageToken only (I3).
+    assert_eq!(body.as_object().expect("object").len(), 2);
+    assert_eq!(body["nextPageToken"], json!("tok"));
+    let issues = body["issues"].as_array().expect("issues array");
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["key"], json!("OPS-7"));
+    shutdown(client, server).await;
+}
+
+/// `list_filters` serves the projection only: sharing metadata and account
+/// ids from the favourite-filter response never reach the client.
+#[tokio::test]
+async fn list_filters_never_serves_sharing_metadata() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/filter/favourite"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "id": "10042",
+            "name": "triage",
+            "description": "weekly",
+            "jql": "project = OPS",
+            "owner": {"displayName": "Alice", "accountId": "acc-1"},
+            "viewUrl": "https://jira.example/issues/?filter=10042",
+            "sharePermissions": [{"type": "group", "group": {"name": "staff"}}],
+            "sharedUsers": {"items": [{"accountId": "acc-2"}]},
+            "subscriptions": {"items": [{"user": {"accountId": "acc-3"}}]},
+        }])))
+        .mount(&mock)
+        .await;
+    let (client, server) = connect(&mock).await;
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("list_filters"))
+        .await
+        .expect("tools/call list_filters");
+
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let text = result_text(&result);
+    for banned in [
+        "sharePermissions",
+        "sharedUsers",
+        "subscriptions",
+        "accountId",
+        "acc-1",
+        "acc-2",
+        "acc-3",
+    ] {
+        assert!(!text.contains(banned), "{banned} leaked: {text}");
+    }
+    let body: Value = serde_json::from_str(text).expect("json body");
+    assert_eq!(body["filters"][0]["id"], json!("10042"));
+    assert_eq!(body["filters"][0]["owner"], json!("Alice"));
+    assert_eq!(body["filters"][0]["jql"], json!("project = OPS"));
+    shutdown(client, server).await;
 }

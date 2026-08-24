@@ -49,3 +49,7 @@ jobs:
             EPL-2.0,
             MPL-1.1,
             OSL-3.0
+          # Exemption: CI actions run on the runner and are never distributed
+          # with the Apache-2.0 binaries, so copyleft here cannot reach the
+          # product. Crates stay governed by deny-licenses and deny.toml.
+          allow-dependencies-licenses: pkg:githubactions/Swatinem/rust-cache
